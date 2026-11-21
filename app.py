@@ -1,22 +1,37 @@
 import os
-import io
 import tempfile
-import ezdxf
-from ezdxf.path import make_path
-import pandas as pd
 import streamlit as st
+from unified_engine_core import UnifiedFabricationEngine
 
 st.set_page_config(
-    page_title="Unified Fabrication Engine",
+    page_title="Gafy AI Engine | Unified Fabrication Platform",
     layout="wide",
     page_icon="⚙️"
 )
+
+LOGO_CANDIDATES = [
+    "logo.png",
+    "gafy_logo.png",
+    "brand_logo.png",
+    "logo.jpg",
+    "logo.jpeg"
+]
+
+
+def find_logo_file() -> str | None:
+    for candidate in LOGO_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+logo_path = find_logo_file()
 
 st.markdown(
     """
     <style>
     .block-container {
-        padding-top: 1.5rem;
+        padding-top: 1.4rem;
         padding-bottom: 2rem;
     }
     .header-card {
@@ -44,53 +59,58 @@ st.markdown(
         border-radius: 10px;
     }
     </style>
-    <div class="header-card">
-        <h1>⚙️ Unified Fabrication &amp; Cutlist Engine</h1>
-        <p>Automated DXF geometry extraction, line/arc merging, and production cutlist export across multi-material contracting.</p>
-    </div>
     """,
     unsafe_allow_html=True
 )
 
-MATERIAL_PROFILES = {
-    "marble_granite": {
-        "label": "Marble & Granite",
-        "kerf": 4.0,
-        "allowance_note": "Saw kerf + polishing/vein alignment allowance"
-    },
-    "mdf_wood": {
-        "label": "MDF & Wood Joinery",
-        "kerf": 3.2,
-        "allowance_note": "Panel saw kerf + grain/edge banding clearance"
-    },
-    "aluminum_profile": {
-        "label": "Aluminum Profiles",
-        "kerf": 5.0,
-        "allowance_note": "Blade kerf + fabrication/milling clearance"
-    },
-    "stainless_steel": {
-        "label": "Stainless Steel / Metals",
-        "kerf": 1.5,
-        "allowance_note": "Laser/plasma kerf + forming tolerance"
-    }
+MATERIAL_OPTIONS = {
+    "marble_granite": "Marble & Granite",
+    "mdf_wood": "MDF & Wood Joinery",
+    "aluminum_profile": "Aluminum Profiles",
+    "stainless_steel": "Stainless Steel / Metals"
 }
 
-st.sidebar.header("Fabrication Controls")
+DEFAULT_KERFS = {
+    "marble_granite": 4.0,
+    "mdf_wood": 3.2,
+    "aluminum_profile": 5.0,
+    "stainless_steel": 1.5
+}
+
+if logo_path:
+    st.sidebar.image(logo_path, use_container_width=True)
+
+st.sidebar.header("Brand & Fabrication Controls")
+brand_name = st.sidebar.text_input("Brand Name", value="Gafy AI Engine")
+
 material_key = st.sidebar.selectbox(
     "Material Profile",
-    options=list(MATERIAL_PROFILES.keys()),
-    format_func=lambda k: MATERIAL_PROFILES[k]["label"]
+    options=list(MATERIAL_OPTIONS.keys()),
+    format_func=lambda k: MATERIAL_OPTIONS[k]
 )
 
 kerf_val = st.sidebar.number_input(
     "Kerf / Cutting Allowance (mm)",
     min_value=0.0,
     max_value=50.0,
-    value=float(MATERIAL_PROFILES[material_key]["kerf"]),
+    value=float(DEFAULT_KERFS[material_key]),
     step=0.5
 )
 
-st.sidebar.info(MATERIAL_PROFILES[material_key]["allowance_note"])
+banner_left, banner_right = st.columns([5, 1], vertical_alignment="center")
+with banner_left:
+    st.markdown(
+        f"""
+        <div class="header-card">
+            <h1>⚙️ {brand_name} — Unified Fabrication &amp; Cutlist Engine</h1>
+            <p>Automated DXF geometry extraction, line/arc merging, sheet estimation, and production cutlist export.</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+with banner_right:
+    if logo_path:
+        st.image(logo_path, use_container_width=True)
 
 left_col, right_col = st.columns([2, 1], gap="large")
 
@@ -99,101 +119,77 @@ with left_col:
 
 with right_col:
     st.markdown("**Active Profile Summary**")
-    st.write(f"**Material:** {MATERIAL_PROFILES[material_key]['label']}")
+    st.write(f"**Brand:** {brand_name}")
+    st.write(f"**Material:** {MATERIAL_OPTIONS[material_key]}")
     st.write(f"**Kerf:** `{kerf_val:.1f} mm`")
 
 if uploaded_file is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
         tmp_file.write(uploaded_file.getvalue())
-        tmp_path = tmp_file.name
+        tmp_dxf_path = tmp_file.name
+
+    tmp_excel_path = tmp_dxf_path.replace(".dxf", "_Cutlist.xlsx")
 
     st.success(f"Loaded drawing: `{uploaded_file.name}`")
 
     if st.button("🚀 Run Fabrication Engine", type="primary"):
-        with st.spinner("Extracting closed polylines and merging connected lines/arcs..."):
+        with st.spinner("Processing geometry, merging lines/arcs, and calculating sheets & wastage..."):
             try:
-                doc = ezdxf.readfile(tmp_path)
-                msp = doc.modelspace()
+                engine = UnifiedFabricationEngine(
+                    dxf_path=tmp_dxf_path,
+                    material_key=material_key,
+                    custom_kerf=kerf_val
+                )
+                pieces = engine.process_geometry()
+                summary = engine.calculate_sheets_and_wastage()
 
-                processed_pieces = []
-                counter = 1
+                if pieces:
+                    import pandas as pd
 
-                for entity in msp:
-                    if entity.dxftype() == "LWPOLYLINE" and entity.closed:
-                        points = list(entity.get_points(format="xy"))
-                        if len(points) >= 3:
-                            xs = [p[0] for p in points]
-                            ys = [p[1] for p in points]
-                            width = max(xs) - min(xs)
-                            height = max(ys) - min(ys)
-                            if width > 0 and height > 0:
-                                processed_pieces.append({
-                                    "Tag": f"{counter:03d}",
-                                    "Material": MATERIAL_PROFILES[material_key]["label"],
-                                    "Source": "Closed Polyline",
-                                    "Cut Width (mm)": round(width + kerf_val, 2),
-                                    "Cut Height (mm)": round(height + kerf_val, 2),
-                                    "Net Area (m2)": round((width * height) / 1_000_000.0, 4)
-                                })
-                                counter += 1
+                    clean_rows = [
+                        {k: v for k, v in p.items() if k != "Polygon Points"}
+                        for p in pieces
+                    ]
+                    df_cutlist = pd.DataFrame(clean_rows)
+                    df_summary = pd.DataFrame(
+                        list(summary.items()),
+                        columns=["Metric", "Value"]
+                    )
 
-                for entity in msp:
-                    if entity.dxftype() in ["LINE", "ARC"]:
-                        try:
-                            path = make_path(entity)
-                            if path.is_closed:
-                                flattened = [(v.x, v.y) for v in path.flattening(distance=0.5)]
-                                if len(flattened) >= 3:
-                                    xs = [p[0] for p in flattened]
-                                    ys = [p[1] for p in flattened]
-                                    w = max(xs) - min(xs)
-                                    h = max(ys) - min(ys)
-                                    if w > 0 and h > 0:
-                                        processed_pieces.append({
-                                            "Tag": f"{counter:03d}",
-                                            "Material": MATERIAL_PROFILES[material_key]["label"],
-                                            "Source": "Merged Line/Arc",
-                                            "Cut Width (mm)": round(w + kerf_val, 2),
-                                            "Cut Height (mm)": round(h + kerf_val, 2),
-                                            "Net Area (m2)": round((w * h) / 1_000_000.0, 4)
-                                        })
-                                        counter += 1
-                        except Exception:
-                            continue
+                    units_count = summary.get(
+                        "Estimated Sheets Required",
+                        summary.get("Estimated Bars Required", 0)
+                    )
+                    wastage_pct = summary.get("Estimated Wastage (%)", 0.0)
 
-                if processed_pieces:
-                    df = pd.DataFrame(processed_pieces)
-
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Total Pieces", len(df))
-                    m2.metric("Total Net Area (m²)", f"{df['Net Area (m2)'].sum():.4f}")
-                    m3.metric("Applied Kerf", f"{kerf_val:.1f} mm")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Total Pieces", len(df_cutlist))
+                    m2.metric("Total Net Area (m²)", f"{df_cutlist['Net Area (m2)'].sum():.4f}")
+                    m3.metric("Estimated Units", units_count)
+                    m4.metric("Estimated Wastage", f"{wastage_pct:.2f}%")
 
                     tab1, tab2, tab3 = st.tabs([
                         "📋 Cutlist Schedule",
-                        "📐 Source Breakdown",
+                        "📦 Sheets & Wastage",
                         "📄 Export Excel"
                     ])
 
                     with tab1:
-                        st.dataframe(df, use_container_width=True, hide_index=True)
+                        st.dataframe(df_cutlist, use_container_width=True, hide_index=True)
 
                     with tab2:
-                        source_counts = df["Source"].value_counts().reset_index()
-                        source_counts.columns = ["Entity Source", "Piece Count"]
-                        st.dataframe(source_counts, use_container_width=True, hide_index=True)
+                        st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
                     with tab3:
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                            df.to_excel(writer, index=False, sheet_name="Cutlist")
-                        excel_data = output.getvalue()
+                        engine.export_to_excel(tmp_excel_path)
+                        with open(tmp_excel_path, "rb") as f:
+                            excel_bytes = f.read()
 
-                        st.write("Download the formatted production schedule for shop floor or technical review:")
+                        st.write("Download the formatted multi-sheet Excel report with cutlist and sheet wastage summary:")
                         st.download_button(
-                            label="📥 Download Excel Cutlist (.xlsx)",
-                            data=excel_data,
-                            file_name=f"Cutlist_{material_key}.xlsx",
+                            label="📥 Download Excel Report (.xlsx)",
+                            data=excel_bytes,
+                            file_name=f"Gafy_Cutlist_{material_key}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
                 else:
@@ -202,5 +198,6 @@ if uploaded_file is not None:
             except Exception as e:
                 st.error(f"Error processing DXF file: {e}")
             finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                for path in [tmp_dxf_path, tmp_excel_path]:
+                    if os.path.exists(path):
+                        os.remove(path)
