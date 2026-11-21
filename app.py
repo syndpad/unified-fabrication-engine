@@ -204,5 +204,3 @@ if uploaded_file is not None:
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-
-<FollowUp label="هل تفضل أن نربط واجهة app.py مباشرة بكلاس UnifiedFabricationEngine الموجود في unified_engine_core.py للاستفادة من حساب الألواح ونسب الهدر؟" query="هل تفضل أن نربط واجهة app.py مباشرة بكلاس UnifiedFabricationEngine الموجود في unified_engine_core.py للاستفادة من حساب الألواح ونسب الهدر؟"/>
