@@ -55,12 +55,14 @@ class UnifiedFabricationEngine:
         dxf_path: str,
         material_key: str = "marble_granite",
         custom_kerf: float = None,
-        exclude_outer_frame: bool = True
+        exclude_outer_frame: bool = False,
+        snap_tolerance: float = 2.0
     ):
         self.dxf_path = dxf_path
         self.material_key = material_key if material_key in self.DEFAULT_PROFILES else "marble_granite"
         self.profile = self.DEFAULT_PROFILES[self.material_key].copy()
         self.exclude_outer_frame = exclude_outer_frame
+        self.snap_tolerance = float(snap_tolerance)
 
         if custom_kerf is not None:
             self.profile["default_kerf_mm"] = float(custom_kerf)
@@ -77,6 +79,16 @@ class UnifiedFabricationEngine:
 
         self.doc = ezdxf.readfile(self.dxf_path)
         self.msp = self.doc.modelspace()
+
+    def inspect_dxf_entities(self) -> dict:
+        """Return counts of entity types present in modelspace for quick diagnostics."""
+        if self.msp is None:
+            self.load_dxf()
+        counts = {}
+        for entity in self.msp:
+            t = entity.dxftype()
+            counts[t] = counts.get(t, 0) + 1
+        return counts
 
     @staticmethod
     def _clean_polygon_points(points: list, eps: float = 1e-3) -> list:
@@ -107,17 +119,14 @@ class UnifiedFabricationEngine:
         bbox_area = bbox_w * bbox_h
         poly_area = self._polygon_area(pts)
 
-        # Check triangle
         if len(pts) == 3:
             return "Triangle"
 
-        # Check curved / arc-dominated loop (many small flattened segments)
         if len(pts) >= 12 and bbox_area > 0:
             area_ratio = poly_area / bbox_area
             if abs(area_ratio - (math.pi / 4.0)) < 0.08 or len(pts) >= 18:
                 return "Curved / Arc"
 
-        # Check axis-aligned rectangle / square
         if bbox_area > 0 and len(pts) <= 6:
             if abs(bbox_area - poly_area) / bbox_area <= 0.02:
                 return "Standard Rect"
@@ -166,10 +175,10 @@ class UnifiedFabricationEngine:
             area -= pts[j][0] * pts[i][1]
         return abs(area) / 2.0
 
-    def _merge_loose_lines_and_arcs(self, tolerance: float = 0.5) -> list:
+    def _merge_loose_lines_and_arcs(self, tolerance: float = 2.0) -> list:
         """
-        Extract individual closed loops from LINE and ARC entities, including
-        inner rectangles, squares, triangles, and curved/arc segments.
+        Extract detailed closed or near-closed loops from LINE and ARC entities,
+        including inner rectangles, squares, triangles, and curved/arc segments.
         """
         segments = []
         for entity in self.msp:
@@ -189,8 +198,6 @@ class UnifiedFabricationEngine:
         closed_loops = []
         used_segments = set()
 
-        # First pass: build closed loops starting from each unused segment
-        # so smaller inner shapes (triangles, rectangles, arc loops) close cleanly
         for start_idx in range(len(segments)):
             if start_idx in used_segments:
                 continue
@@ -214,17 +221,17 @@ class UnifiedFabricationEngine:
                     d_end_start = dist(chain[-1], seg[0])
                     if d_end_start <= best_dist:
                         best_dist = d_end_start
-                        best_match = (cand_idx, seg[1:], "append")
+                        best_match = (cand_idx, seg[1:])
 
                     d_end_end = dist(chain[-1], seg[-1])
                     if d_end_end <= best_dist:
                         best_dist = d_end_end
-                        best_match = (cand_idx, list(reversed(seg[:-1])), "append")
+                        best_match = (cand_idx, list(reversed(seg[:-1])))
 
                 if best_match is None:
                     break
 
-                cand_idx, extension, _ = best_match
+                cand_idx, extension = best_match
                 chain.extend(extension)
                 chain_used.add(cand_idx)
 
@@ -232,9 +239,10 @@ class UnifiedFabricationEngine:
                     closed_here = True
                     break
 
-            if closed_here:
-                cleaned = self._clean_polygon_points(chain, eps=1e-3)
-                if len(cleaned) >= 3 and self._polygon_area(cleaned) > 1.0:
+            # Accept closed loops OR valid multi-segment chains forming a real 2D part
+            cleaned = self._clean_polygon_points(chain, eps=1e-3)
+            if len(cleaned) >= 3 and self._polygon_area(cleaned) > 0.5:
+                if closed_here or len(chain_used) >= 2:
                     closed_loops.append(cleaned)
                     used_segments.update(chain_used)
 
@@ -274,15 +282,19 @@ class UnifiedFabricationEngine:
                 enclosed_count += 1
 
         if enclosed_count >= 2 and max_area > 0:
-            return [(src, pts) for src, pts, _, _ in areas_and_boxes if (src, pts) != (max_entry[0], max_entry[1])]
+            return [
+                (src, pts)
+                for src, pts, _, _ in areas_and_boxes
+                if not (src == max_entry[0] and pts == max_entry[1])
+            ]
 
         return polygons_with_source
 
     def process_geometry(self) -> list:
         """
-        Extract closed LWPOLYLINEs, closed curves, and detailed inner LINE/ARC loops
-        (rectangles, squares, triangles, arcs), assign 3-digit tags (001, 002, ...),
-        and apply cutting kerf allowances.
+        Extract detailed parts including inner rectangles, squares, triangles,
+        curved/arc loops, and closed/near-closed polylines, assign 3-digit tags
+        (001, 002, ...), and apply cutting kerf allowances.
         """
         if self.msp is None:
             self.load_dxf()
@@ -290,37 +302,46 @@ class UnifiedFabricationEngine:
         kerf = float(self.profile["default_kerf_mm"])
         raw_polygons = []
 
-        # 1. Closed LWPOLYLINE entities (rectangles, squares, triangles, custom polygons)
+        # 1. LWPOLYLINE & POLYLINE entities (closed or near-closed)
         for entity in self.msp:
-            if entity.dxftype() == "LWPOLYLINE" and entity.closed:
+            etype = entity.dxftype()
+            if etype in ("LWPOLYLINE", "POLYLINE"):
                 try:
                     p = make_path(entity)
                     pts = [(v.x, v.y) for v in p.flattening(distance=0.5)]
                 except Exception:
-                    pts = list(entity.get_points(format="xy"))
+                    if etype == "LWPOLYLINE":
+                        pts = list(entity.get_points(format="xy"))
+                    else:
+                        pts = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
 
                 cleaned_pts = self._clean_polygon_points(pts)
-                if len(cleaned_pts) >= 3 and self._polygon_area(cleaned_pts) > 1.0:
-                    raw_polygons.append(("Closed Polyline", cleaned_pts))
+                is_closed_flag = bool(getattr(entity, "closed", False) or getattr(entity, "is_closed", False))
+                near_closed = (
+                    len(cleaned_pts) >= 3
+                    and math.hypot(cleaned_pts[0][0] - cleaned_pts[-1][0], cleaned_pts[0][1] - cleaned_pts[-1][1]) <= self.snap_tolerance
+                )
+                if len(cleaned_pts) >= 3 and (is_closed_flag or near_closed) and self._polygon_area(cleaned_pts) > 0.5:
+                    raw_polygons.append(("Polyline Part", cleaned_pts))
 
-        # 2. Full CIRCLE / ELLIPSE entities
+        # 2. CIRCLE / ELLIPSE entities
         for entity in self.msp:
             if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
                 try:
                     p = make_path(entity)
                     pts = [(v.x, v.y) for v in p.flattening(distance=0.5)]
                     cleaned_pts = self._clean_polygon_points(pts)
-                    if len(cleaned_pts) >= 6 and self._polygon_area(cleaned_pts) > 1.0:
+                    if len(cleaned_pts) >= 6 and self._polygon_area(cleaned_pts) > 0.5:
                         raw_polygons.append(("Curved Loop", cleaned_pts))
                 except Exception:
                     continue
 
-        # 3. Detailed inner/loose LINE & ARC loops
-        merged_loops = self._merge_loose_lines_and_arcs(tolerance=0.5)
+        # 3. Detailed inner LINE & ARC loops (triangles, rectangles, squares, arcs)
+        merged_loops = self._merge_loose_lines_and_arcs(tolerance=self.snap_tolerance)
         for pts in merged_loops:
             cleaned_pts = self._clean_polygon_points(pts)
-            if len(cleaned_pts) >= 3 and self._polygon_area(cleaned_pts) > 1.0:
-                raw_polygons.append(("Merged Line/Arc", cleaned_pts))
+            if len(cleaned_pts) >= 3 and self._polygon_area(cleaned_pts) > 0.5:
+                raw_polygons.append(("Detailed Line/Arc", cleaned_pts))
 
         if self.exclude_outer_frame:
             raw_polygons = self._filter_outer_frame_if_needed(raw_polygons)
