@@ -1,5 +1,6 @@
 import os
 import tempfile
+import pandas as pd
 import streamlit as st
 from unified_engine_core import UnifiedFabricationEngine
 
@@ -10,8 +11,9 @@ st.set_page_config(
 )
 
 LOGO_CANDIDATES = [
-    "logo.png",
+    "Gafy_Logo.png",
     "gafy_logo.png",
+    "logo.png",
     "brand_logo.png",
     "logo.jpg",
     "logo.jpeg"
@@ -103,7 +105,7 @@ with banner_left:
         f"""
         <div class="header-card">
             <h1>⚙️ {brand_name} — Unified Fabrication &amp; Cutlist Engine</h1>
-            <p>Automated DXF geometry extraction, line/arc merging, sheet estimation, and production cutlist export.</p>
+            <p>Automated DXF geometry extraction, line/arc merging, sheet estimation, shop drawings, and detail sheets export.</p>
         </div>
         """,
         unsafe_allow_html=True
@@ -129,11 +131,13 @@ if uploaded_file is not None:
         tmp_dxf_path = tmp_file.name
 
     tmp_excel_path = tmp_dxf_path.replace(".dxf", "_Cutlist.xlsx")
+    tmp_shop_dxf_path = tmp_dxf_path.replace(".dxf", "_Tagged_ShopDrawing.dxf")
+    tmp_detail_dxf_path = tmp_dxf_path.replace(".dxf", "_Detail_Sheets.dxf")
 
     st.success(f"Loaded drawing: `{uploaded_file.name}`")
 
     if st.button("🚀 Run Fabrication Engine", type="primary"):
-        with st.spinner("Processing geometry, merging lines/arcs, and calculating sheets & wastage..."):
+        with st.spinner("Processing geometry, calculating sheets & wastage, and generating CAD/Excel deliverables..."):
             try:
                 engine = UnifiedFabricationEngine(
                     dxf_path=tmp_dxf_path,
@@ -144,8 +148,6 @@ if uploaded_file is not None:
                 summary = engine.calculate_sheets_and_wastage()
 
                 if pieces:
-                    import pandas as pd
-
                     clean_rows = [
                         {k: v for k, v in p.items() if k != "Polygon Points"}
                         for p in pieces
@@ -168,10 +170,21 @@ if uploaded_file is not None:
                     m3.metric("Estimated Units", units_count)
                     m4.metric("Estimated Wastage", f"{wastage_pct:.2f}%")
 
+                    engine.export_to_excel(tmp_excel_path)
+                    engine.export_processed_dxf(tmp_shop_dxf_path)
+                    engine.export_detail_sheets_dxf(tmp_detail_dxf_path)
+
+                    with open(tmp_excel_path, "rb") as f:
+                        excel_bytes = f.read()
+                    with open(tmp_shop_dxf_path, "rb") as f:
+                        shop_dxf_bytes = f.read()
+                    with open(tmp_detail_dxf_path, "rb") as f:
+                        detail_dxf_bytes = f.read()
+
                     tab1, tab2, tab3 = st.tabs([
                         "📋 Cutlist Schedule",
                         "📦 Sheets & Wastage",
-                        "📄 Export Excel"
+                        "📥 Export Deliverables"
                     ])
 
                     with tab1:
@@ -181,23 +194,41 @@ if uploaded_file is not None:
                         st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
                     with tab3:
-                        engine.export_to_excel(tmp_excel_path)
-                        with open(tmp_excel_path, "rb") as f:
-                            excel_bytes = f.read()
+                        st.write("Download all generated deliverables for shop floor production and technical documentation:")
+                        d1, d2, d3 = st.columns(3)
 
-                        st.write("Download the formatted multi-sheet Excel report with cutlist and sheet wastage summary:")
-                        st.download_button(
-                            label="📥 Download Excel Report (.xlsx)",
-                            data=excel_bytes,
-                            file_name=f"Gafy_Cutlist_{material_key}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+                        with d1:
+                            st.download_button(
+                                label="📊 Download Excel Cutlist (.xlsx)",
+                                data=excel_bytes,
+                                file_name=f"Gafy_Cutlist_{material_key}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True
+                            )
+
+                        with d2:
+                            st.download_button(
+                                label="📐 Download Shop Drawing (.dxf)",
+                                data=shop_dxf_bytes,
+                                file_name=f"Gafy_Tagged_ShopDrawing_{material_key}.dxf",
+                                mime="application/dxf",
+                                use_container_width=True
+                            )
+
+                        with d3:
+                            st.download_button(
+                                label="🗂️ Download Detail Sheets (.dxf)",
+                                data=detail_dxf_bytes,
+                                file_name=f"Gafy_Detail_Sheets_{material_key}.dxf",
+                                mime="application/dxf",
+                                use_container_width=True
+                            )
                 else:
                     st.warning("No closed geometric pieces were detected in the uploaded DXF file.")
 
             except Exception as e:
                 st.error(f"Error processing DXF file: {e}")
             finally:
-                for path in [tmp_dxf_path, tmp_excel_path]:
+                for path in [tmp_dxf_path, tmp_excel_path, tmp_shop_dxf_path, tmp_detail_dxf_path]:
                     if os.path.exists(path):
                         os.remove(path)
