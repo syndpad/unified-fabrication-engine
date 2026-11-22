@@ -56,7 +56,7 @@ class UnifiedFabricationEngine:
         material_key: str = "marble_granite",
         custom_kerf: float = None,
         exclude_outer_frame: bool = False,
-        snap_tolerance: float = 2.0
+        snap_tolerance: float = 3.0
     ):
         self.dxf_path = dxf_path
         self.material_key = material_key if material_key in self.DEFAULT_PROFILES else "marble_granite"
@@ -105,9 +105,7 @@ class UnifiedFabricationEngine:
         return cleaned
 
     def _classify_shape(self, points: list) -> str:
-        """
-        Classify closed detailed parts: Rectangle/Square, Triangle, Curved/Arc, or Custom Polygon.
-        """
+        """Classify closed detailed parts: Rectangle/Square, Triangle, Curved/Arc, or Custom Polygon."""
         pts = self._clean_polygon_points(points)
         if len(pts) < 3:
             return "Custom / Detail"
@@ -134,10 +132,7 @@ class UnifiedFabricationEngine:
         return "Custom / Detail"
 
     def _get_min_wastage_bbox(self, points: list) -> tuple:
-        """
-        Calculate minimum-area bounding box across candidate orientations
-        to reduce sheet wastage on angled, triangular, or irregular parts.
-        """
+        """Calculate minimum-area bounding box across candidate orientations."""
         pts = self._clean_polygon_points(points)
         if len(pts) < 3:
             return 0.0, 0.0
@@ -175,14 +170,25 @@ class UnifiedFabricationEngine:
             area -= pts[j][0] * pts[i][1]
         return abs(area) / 2.0
 
-    def _merge_loose_lines_and_arcs(self, tolerance: float = 2.0) -> list:
+    def _collect_geometry_entities(self):
+        """Yield modelspace entities and virtual entities from exploded INSERT blocks."""
+        for entity in self.msp:
+            yield entity
+            if entity.dxftype() == "INSERT":
+                try:
+                    for virtual_ent in entity.virtual_entities():
+                        yield virtual_ent
+                except Exception:
+                    continue
+
+    def _merge_loose_lines_and_arcs(self, tolerance: float = 3.0) -> list:
         """
-        Extract detailed closed or near-closed loops from LINE and ARC entities,
-        including inner rectangles, squares, triangles, and curved/arc segments.
+        Build complete closed loops from LINE, ARC, and SPLINE segments using
+        bi-directional endpoint snapping so inner shapes close reliably.
         """
         segments = []
-        for entity in self.msp:
-            if entity.dxftype() in ("LINE", "ARC"):
+        for entity in self._collect_geometry_entities():
+            if entity.dxftype() in ("LINE", "ARC", "SPLINE"):
                 try:
                     p = make_path(entity)
                     pts = [(round(v.x, 3), round(v.y, 3)) for v in p.flattening(distance=0.5)]
@@ -218,33 +224,47 @@ class UnifiedFabricationEngine:
                     if cand_idx in chain_used:
                         continue
 
-                    d_end_start = dist(chain[-1], seg[0])
-                    if d_end_start <= best_dist:
-                        best_dist = d_end_start
-                        best_match = (cand_idx, seg[1:])
+                    # Match at tail of chain
+                    d_tail_start = dist(chain[-1], seg[0])
+                    if d_tail_start <= best_dist:
+                        best_dist = d_tail_start
+                        best_match = ("tail", cand_idx, seg[1:])
 
-                    d_end_end = dist(chain[-1], seg[-1])
-                    if d_end_end <= best_dist:
-                        best_dist = d_end_end
-                        best_match = (cand_idx, list(reversed(seg[:-1])))
+                    d_tail_end = dist(chain[-1], seg[-1])
+                    if d_tail_end <= best_dist:
+                        best_dist = d_tail_end
+                        best_match = ("tail", cand_idx, list(reversed(seg[:-1])))
+
+                    # Match at head of chain
+                    d_head_end = dist(chain[0], seg[-1])
+                    if d_head_end <= best_dist:
+                        best_dist = d_head_end
+                        best_match = ("head", cand_idx, seg[:-1])
+
+                    d_head_start = dist(chain[0], seg[0])
+                    if d_head_start <= best_dist:
+                        best_dist = d_head_start
+                        best_match = ("head", cand_idx, list(reversed(seg[1:])))
 
                 if best_match is None:
                     break
 
-                cand_idx, extension = best_match
-                chain.extend(extension)
+                side, cand_idx, piece_pts = best_match
+                if side == "tail":
+                    chain.extend(piece_pts)
+                else:
+                    chain = piece_pts + chain
+
                 chain_used.add(cand_idx)
 
                 if len(chain) >= 3 and dist(chain[-1], chain[0]) <= tolerance:
                     closed_here = True
                     break
 
-            # Accept closed loops OR valid multi-segment chains forming a real 2D part
             cleaned = self._clean_polygon_points(chain, eps=1e-3)
-            if len(cleaned) >= 3 and self._polygon_area(cleaned) > 0.5:
-                if closed_here or len(chain_used) >= 2:
-                    closed_loops.append(cleaned)
-                    used_segments.update(chain_used)
+            if closed_here and len(cleaned) >= 3 and self._polygon_area(cleaned) > 0.5:
+                closed_loops.append(cleaned)
+                used_segments.update(chain_used)
 
         return closed_loops
 
@@ -292,9 +312,8 @@ class UnifiedFabricationEngine:
 
     def process_geometry(self) -> list:
         """
-        Extract detailed parts including inner rectangles, squares, triangles,
-        curved/arc loops, and closed/near-closed polylines, assign 3-digit tags
-        (001, 002, ...), and apply cutting kerf allowances.
+        Extract complete closed polylines, curves, and detailed inner LINE/ARC/SPLINE loops,
+        assign 3-digit tags (001, 002, ...), and apply cutting kerf allowances.
         """
         if self.msp is None:
             self.load_dxf()
@@ -302,8 +321,8 @@ class UnifiedFabricationEngine:
         kerf = float(self.profile["default_kerf_mm"])
         raw_polygons = []
 
-        # 1. LWPOLYLINE & POLYLINE entities (closed or near-closed)
-        for entity in self.msp:
+        # 1. Closed or near-closed LWPOLYLINE / POLYLINE entities
+        for entity in self._collect_geometry_entities():
             etype = entity.dxftype()
             if etype in ("LWPOLYLINE", "POLYLINE"):
                 try:
@@ -324,8 +343,8 @@ class UnifiedFabricationEngine:
                 if len(cleaned_pts) >= 3 and (is_closed_flag or near_closed) and self._polygon_area(cleaned_pts) > 0.5:
                     raw_polygons.append(("Polyline Part", cleaned_pts))
 
-        # 2. CIRCLE / ELLIPSE entities
-        for entity in self.msp:
+        # 2. Full CIRCLE / ELLIPSE entities
+        for entity in self._collect_geometry_entities():
             if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
                 try:
                     p = make_path(entity)
@@ -336,7 +355,7 @@ class UnifiedFabricationEngine:
                 except Exception:
                     continue
 
-        # 3. Detailed inner LINE & ARC loops (triangles, rectangles, squares, arcs)
+        # 3. Completed closed loops from LINE, ARC, and SPLINE segments
         merged_loops = self._merge_loose_lines_and_arcs(tolerance=self.snap_tolerance)
         for pts in merged_loops:
             cleaned_pts = self._clean_polygon_points(pts)
@@ -374,9 +393,7 @@ class UnifiedFabricationEngine:
         return self.extracted_pieces
 
     def calculate_sheets_and_wastage(self) -> dict:
-        """
-        Estimate required sheets (2D) or linear bars (1D) and overall wastage percentage.
-        """
+        """Estimate required sheets (2D) or linear bars (1D) and overall wastage percentage."""
         if not self.extracted_pieces:
             self.process_geometry()
 
