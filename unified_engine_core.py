@@ -50,10 +50,17 @@ class UnifiedFabricationEngine:
         }
     }
 
-    def __init__(self, dxf_path: str, material_key: str = "marble_granite", custom_kerf: float = None):
+    def __init__(
+        self,
+        dxf_path: str,
+        material_key: str = "marble_granite",
+        custom_kerf: float = None,
+        exclude_outer_frame: bool = True
+    ):
         self.dxf_path = dxf_path
         self.material_key = material_key if material_key in self.DEFAULT_PROFILES else "marble_granite"
         self.profile = self.DEFAULT_PROFILES[self.material_key].copy()
+        self.exclude_outer_frame = exclude_outer_frame
 
         if custom_kerf is not None:
             self.profile["default_kerf_mm"] = float(custom_kerf)
@@ -72,7 +79,7 @@ class UnifiedFabricationEngine:
         self.msp = self.doc.modelspace()
 
     @staticmethod
-    def _clean_polygon_points(points: list, eps: float = 1e-4) -> list:
+    def _clean_polygon_points(points: list, eps: float = 1e-3) -> list:
         """Remove invalid coordinates and consecutive duplicate points."""
         cleaned = []
         for p in points:
@@ -85,31 +92,42 @@ class UnifiedFabricationEngine:
             cleaned.pop()
         return cleaned
 
-    def _is_standard_rectangle(self, points: list, area_tol: float = 0.02) -> bool:
+    def _classify_shape(self, points: list) -> str:
         """
-        Check whether a closed polygon closely matches a simple axis-aligned rectangle.
-        Non-rectangular or custom shapes return False so they receive detail sheets.
+        Classify closed detailed parts: Rectangle/Square, Triangle, Curved/Arc, or Custom Polygon.
         """
         pts = self._clean_polygon_points(points)
-        if len(pts) < 4:
-            return False
+        if len(pts) < 3:
+            return "Custom / Detail"
 
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         bbox_w = max(xs) - min(xs)
         bbox_h = max(ys) - min(ys)
         bbox_area = bbox_w * bbox_h
-        if bbox_area <= 0:
-            return False
-
         poly_area = self._polygon_area(pts)
-        area_ratio_diff = abs(bbox_area - poly_area) / bbox_area
-        return len(pts) <= 5 and area_ratio_diff <= area_tol
+
+        # Check triangle
+        if len(pts) == 3:
+            return "Triangle"
+
+        # Check curved / arc-dominated loop (many small flattened segments)
+        if len(pts) >= 12 and bbox_area > 0:
+            area_ratio = poly_area / bbox_area
+            if abs(area_ratio - (math.pi / 4.0)) < 0.08 or len(pts) >= 18:
+                return "Curved / Arc"
+
+        # Check axis-aligned rectangle / square
+        if bbox_area > 0 and len(pts) <= 6:
+            if abs(bbox_area - poly_area) / bbox_area <= 0.02:
+                return "Standard Rect"
+
+        return "Custom / Detail"
 
     def _get_min_wastage_bbox(self, points: list) -> tuple:
         """
         Calculate minimum-area bounding box across candidate orientations
-        to reduce sheet wastage on angled or irregular parts.
+        to reduce sheet wastage on angled, triangular, or irregular parts.
         """
         pts = self._clean_polygon_points(points)
         if len(pts) < 3:
@@ -150,9 +168,10 @@ class UnifiedFabricationEngine:
 
     def _merge_loose_lines_and_arcs(self, tolerance: float = 0.5) -> list:
         """
-        Connect adjacent LINE and ARC entities into closed polygon point lists.
+        Extract individual closed loops from LINE and ARC entities, including
+        inner rectangles, squares, triangles, and curved/arc segments.
         """
-        loose_paths = []
+        segments = []
         for entity in self.msp:
             if entity.dxftype() in ("LINE", "ARC"):
                 try:
@@ -160,58 +179,110 @@ class UnifiedFabricationEngine:
                     pts = [(round(v.x, 3), round(v.y, 3)) for v in p.flattening(distance=0.5)]
                     pts = self._clean_polygon_points(pts, eps=1e-3)
                     if len(pts) >= 2:
-                        loose_paths.append(pts)
+                        segments.append(pts)
                 except Exception:
                     continue
-
-        closed_polygons = []
-        used = [False] * len(loose_paths)
 
         def dist(p1, p2):
             return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-        for i in range(len(loose_paths)):
-            if used[i]:
+        closed_loops = []
+        used_segments = set()
+
+        # First pass: build closed loops starting from each unused segment
+        # so smaller inner shapes (triangles, rectangles, arc loops) close cleanly
+        for start_idx in range(len(segments)):
+            if start_idx in used_segments:
                 continue
 
-            chain = list(loose_paths[i])
-            used[i] = True
-            merged = True
+            chain = list(segments[start_idx])
+            chain_used = {start_idx}
+            closed_here = False
 
-            while merged:
-                merged = False
-                for j in range(len(loose_paths)):
-                    if used[j]:
+            while True:
+                if len(chain) >= 3 and dist(chain[-1], chain[0]) <= tolerance:
+                    closed_here = True
+                    break
+
+                best_match = None
+                best_dist = tolerance + 1e-6
+
+                for cand_idx, seg in enumerate(segments):
+                    if cand_idx in chain_used:
                         continue
-                    seg = loose_paths[j]
 
-                    if dist(chain[-1], seg[0]) <= tolerance:
-                        chain.extend(seg[1:])
-                        used[j] = True
-                        merged = True
-                    elif dist(chain[-1], seg[-1]) <= tolerance:
-                        chain.extend(reversed(seg[:-1]))
-                        used[j] = True
-                        merged = True
-                    elif dist(chain[0], seg[-1]) <= tolerance:
-                        chain = seg[:-1] + chain
-                        used[j] = True
-                        merged = True
-                    elif dist(chain[0], seg[0]) <= tolerance:
-                        chain = list(reversed(seg[1:])) + chain
-                        used[j] = True
-                        merged = True
+                    d_end_start = dist(chain[-1], seg[0])
+                    if d_end_start <= best_dist:
+                        best_dist = d_end_start
+                        best_match = (cand_idx, seg[1:], "append")
 
-            cleaned_chain = self._clean_polygon_points(chain, eps=1e-3)
-            if len(cleaned_chain) >= 3 and dist(cleaned_chain[0], cleaned_chain[-1]) <= tolerance:
-                closed_polygons.append(cleaned_chain)
+                    d_end_end = dist(chain[-1], seg[-1])
+                    if d_end_end <= best_dist:
+                        best_dist = d_end_end
+                        best_match = (cand_idx, list(reversed(seg[:-1])), "append")
 
-        return closed_polygons
+                if best_match is None:
+                    break
+
+                cand_idx, extension, _ = best_match
+                chain.extend(extension)
+                chain_used.add(cand_idx)
+
+                if len(chain) >= 3 and dist(chain[-1], chain[0]) <= tolerance:
+                    closed_here = True
+                    break
+
+            if closed_here:
+                cleaned = self._clean_polygon_points(chain, eps=1e-3)
+                if len(cleaned) >= 3 and self._polygon_area(cleaned) > 1.0:
+                    closed_loops.append(cleaned)
+                    used_segments.update(chain_used)
+
+        return closed_loops
+
+    @staticmethod
+    def _filter_outer_frame_if_needed(polygons_with_source: list) -> list:
+        """
+        If an oversized outer border encloses several smaller pieces, remove the
+        enclosing outer frame so detailed inner parts remain cleanly isolated.
+        """
+        if len(polygons_with_source) < 3:
+            return polygons_with_source
+
+        areas_and_boxes = []
+        for src, pts in polygons_with_source:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            bbox = (min(xs), min(ys), max(xs), max(ys))
+            bbox_area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 0.0)
+            areas_and_boxes.append((src, pts, bbox, bbox_area))
+
+        max_entry = max(areas_and_boxes, key=lambda x: x[3])
+        _, _, max_box, max_area = max_entry
+
+        enclosed_count = 0
+        for item in areas_and_boxes:
+            if item is max_entry:
+                continue
+            _, _, b, _ = item
+            if (
+                b[0] >= max_box[0] - 1.0
+                and b[1] >= max_box[1] - 1.0
+                and b[2] <= max_box[2] + 1.0
+                and b[3] <= max_box[3] + 1.0
+            ):
+                enclosed_count += 1
+
+        if enclosed_count >= 2 and max_area > 0:
+            return [(src, pts) for src, pts, _, _ in areas_and_boxes if (src, pts) != (max_entry[0], max_entry[1])]
+
+        return polygons_with_source
 
     def process_geometry(self) -> list:
         """
-        Extract closed LWPOLYLINE entities and merged LINE/ARC loops,
-        assign 3-digit tags (001, 002, ...), and apply cutting kerf allowances.
+        Extract closed LWPOLYLINEs, closed curves, and detailed inner LINE/ARC loops
+        (rectangles, squares, triangles, arcs), assign 3-digit tags (001, 002, ...),
+        and apply cutting kerf allowances.
         """
         if self.msp is None:
             self.load_dxf()
@@ -219,6 +290,7 @@ class UnifiedFabricationEngine:
         kerf = float(self.profile["default_kerf_mm"])
         raw_polygons = []
 
+        # 1. Closed LWPOLYLINE entities (rectangles, squares, triangles, custom polygons)
         for entity in self.msp:
             if entity.dxftype() == "LWPOLYLINE" and entity.closed:
                 try:
@@ -228,14 +300,30 @@ class UnifiedFabricationEngine:
                     pts = list(entity.get_points(format="xy"))
 
                 cleaned_pts = self._clean_polygon_points(pts)
-                if len(cleaned_pts) >= 3:
+                if len(cleaned_pts) >= 3 and self._polygon_area(cleaned_pts) > 1.0:
                     raw_polygons.append(("Closed Polyline", cleaned_pts))
 
-        merged_polys = self._merge_loose_lines_and_arcs(tolerance=0.5)
-        for pts in merged_polys:
+        # 2. Full CIRCLE / ELLIPSE entities
+        for entity in self.msp:
+            if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
+                try:
+                    p = make_path(entity)
+                    pts = [(v.x, v.y) for v in p.flattening(distance=0.5)]
+                    cleaned_pts = self._clean_polygon_points(pts)
+                    if len(cleaned_pts) >= 6 and self._polygon_area(cleaned_pts) > 1.0:
+                        raw_polygons.append(("Curved Loop", cleaned_pts))
+                except Exception:
+                    continue
+
+        # 3. Detailed inner/loose LINE & ARC loops
+        merged_loops = self._merge_loose_lines_and_arcs(tolerance=0.5)
+        for pts in merged_loops:
             cleaned_pts = self._clean_polygon_points(pts)
-            if len(cleaned_pts) >= 3:
+            if len(cleaned_pts) >= 3 and self._polygon_area(cleaned_pts) > 1.0:
                 raw_polygons.append(("Merged Line/Arc", cleaned_pts))
+
+        if self.exclude_outer_frame:
+            raw_polygons = self._filter_outer_frame_if_needed(raw_polygons)
 
         self.extracted_pieces = []
         for idx, (source_type, pts) in enumerate(raw_polygons, start=1):
@@ -245,14 +333,14 @@ class UnifiedFabricationEngine:
             cut_len = round(net_len + kerf, 2)
             cut_wid = round(net_wid + kerf, 2)
             gross_bbox_area_m2 = (cut_len * cut_wid) / 1_000_000.0
-            is_rect = self._is_standard_rectangle(pts)
+            shape_type = self._classify_shape(pts)
 
             if net_len > 0 and net_wid > 0:
                 self.extracted_pieces.append({
                     "Tag": f"{idx:03d}",
                     "Material": self.profile["name"],
                     "Source Entity": source_type,
-                    "Shape Type": "Standard Rect" if is_rect else "Custom / Detail",
+                    "Shape Type": shape_type,
                     "Net Length (mm)": net_len,
                     "Net Width (mm)": net_wid,
                     "Cut Length + Kerf (mm)": cut_len,
@@ -436,8 +524,9 @@ class UnifiedFabricationEngine:
         include_all_if_no_custom: bool = True
     ) -> str:
         """
-        Generate dedicated Detail Sheets in DXF for custom/non-rectangular pieces
-        with frame borders, 3-digit tags (no circles), and overall dimensions.
+        Generate dedicated Detail Sheets in DXF for detailed/custom/non-rectangular
+        pieces (triangles, curves/arcs, custom profiles) with frame borders,
+        3-digit tags (no circles), and overall dimensions.
         """
         if not self.extracted_pieces:
             self.process_geometry()
@@ -535,7 +624,7 @@ class UnifiedFabricationEngine:
             )
 
             out_msp.add_text(
-                f"TAG {piece['Tag']} | L:{piece['Net Length (mm)']} x W:{piece['Net Width (mm)']} mm",
+                f"TAG {piece['Tag']} | {piece['Shape Type']} | L:{piece['Net Length (mm)']} x W:{piece['Net Width (mm)']} mm",
                 dxfattribs={
                     "layer": "GAFY_DETAIL_TAGS",
                     "height": 14.0,
