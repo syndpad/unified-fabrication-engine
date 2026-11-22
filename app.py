@@ -79,6 +79,9 @@ DEFAULT_KERFS = {
     "stainless_steel": 1.5
 }
 
+if "fabrication_results" not in st.session_state:
+    st.session_state.fabrication_results = None
+
 if logo_path:
     st.sidebar.image(logo_path, use_container_width=True)
 
@@ -126,19 +129,31 @@ with right_col:
     st.write(f"**Kerf:** `{kerf_val:.1f} mm`")
 
 if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
-        tmp_file.write(uploaded_file.getvalue())
-        tmp_dxf_path = tmp_file.name
-
-    tmp_excel_path = tmp_dxf_path.replace(".dxf", "_Cutlist.xlsx")
-    tmp_shop_dxf_path = tmp_dxf_path.replace(".dxf", "_Tagged_ShopDrawing.dxf")
-    tmp_detail_dxf_path = tmp_dxf_path.replace(".dxf", "_Detail_Sheets.dxf")
+    current_sig = f"{uploaded_file.name}_{uploaded_file.size}_{material_key}_{kerf_val}"
+    if (
+        st.session_state.fabrication_results is not None
+        and st.session_state.fabrication_results.get("signature") != current_sig
+    ):
+        st.session_state.fabrication_results = None
 
     st.success(f"Loaded drawing: `{uploaded_file.name}`")
 
     if st.button("🚀 Run Fabrication Engine", type="primary"):
         with st.spinner("Processing geometry, calculating sheets & wastage, and generating CAD/Excel deliverables..."):
+            tmp_dxf_path = None
+            tmp_excel_path = None
+            tmp_shop_dxf_path = None
+            tmp_detail_dxf_path = None
+
             try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_dxf_path = tmp_file.name
+
+                tmp_excel_path = tmp_dxf_path.replace(".dxf", "_Cutlist.xlsx")
+                tmp_shop_dxf_path = tmp_dxf_path.replace(".dxf", "_Tagged_ShopDrawing.dxf")
+                tmp_detail_dxf_path = tmp_dxf_path.replace(".dxf", "_Detail_Sheets.dxf")
+
                 engine = UnifiedFabricationEngine(
                     dxf_path=tmp_dxf_path,
                     material_key=material_key,
@@ -158,18 +173,6 @@ if uploaded_file is not None:
                         columns=["Metric", "Value"]
                     )
 
-                    units_count = summary.get(
-                        "Estimated Sheets Required",
-                        summary.get("Estimated Bars Required", 0)
-                    )
-                    wastage_pct = summary.get("Estimated Wastage (%)", 0.0)
-
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Total Pieces", len(df_cutlist))
-                    m2.metric("Total Net Area (m²)", f"{df_cutlist['Net Area (m2)'].sum():.4f}")
-                    m3.metric("Estimated Units", units_count)
-                    m4.metric("Estimated Wastage", f"{wastage_pct:.2f}%")
-
                     engine.export_to_excel(tmp_excel_path)
                     engine.export_processed_dxf(tmp_shop_dxf_path)
                     engine.export_detail_sheets_dxf(tmp_detail_dxf_path)
@@ -181,54 +184,88 @@ if uploaded_file is not None:
                     with open(tmp_detail_dxf_path, "rb") as f:
                         detail_dxf_bytes = f.read()
 
-                    tab1, tab2, tab3 = st.tabs([
-                        "📋 Cutlist Schedule",
-                        "📦 Sheets & Wastage",
-                        "📥 Export Deliverables"
-                    ])
+                    units_count = summary.get(
+                        "Estimated Sheets Required",
+                        summary.get("Estimated Bars Required", 0)
+                    )
+                    wastage_pct = summary.get("Estimated Wastage (%)", 0.0)
 
-                    with tab1:
-                        st.dataframe(df_cutlist, use_container_width=True, hide_index=True)
-
-                    with tab2:
-                        st.dataframe(df_summary, use_container_width=True, hide_index=True)
-
-                    with tab3:
-                        st.write("Download all generated deliverables for shop floor production and technical documentation:")
-                        d1, d2, d3 = st.columns(3)
-
-                        with d1:
-                            st.download_button(
-                                label="📊 Download Excel Cutlist (.xlsx)",
-                                data=excel_bytes,
-                                file_name=f"Gafy_Cutlist_{material_key}.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                use_container_width=True
-                            )
-
-                        with d2:
-                            st.download_button(
-                                label="📐 Download Shop Drawing (.dxf)",
-                                data=shop_dxf_bytes,
-                                file_name=f"Gafy_Tagged_ShopDrawing_{material_key}.dxf",
-                                mime="application/dxf",
-                                use_container_width=True
-                            )
-
-                        with d3:
-                            st.download_button(
-                                label="🗂️ Download Detail Sheets (.dxf)",
-                                data=detail_dxf_bytes,
-                                file_name=f"Gafy_Detail_Sheets_{material_key}.dxf",
-                                mime="application/dxf",
-                                use_container_width=True
-                            )
+                    st.session_state.fabrication_results = {
+                        "signature": current_sig,
+                        "material_key": material_key,
+                        "total_pieces": len(df_cutlist),
+                        "total_net_area": float(df_cutlist["Net Area (m2)"].sum()),
+                        "units_count": units_count,
+                        "wastage_pct": float(wastage_pct),
+                        "df_cutlist": df_cutlist,
+                        "df_summary": df_summary,
+                        "excel_bytes": excel_bytes,
+                        "shop_dxf_bytes": shop_dxf_bytes,
+                        "detail_dxf_bytes": detail_dxf_bytes
+                    }
                 else:
+                    st.session_state.fabrication_results = None
                     st.warning("No closed geometric pieces were detected in the uploaded DXF file.")
 
             except Exception as e:
+                st.session_state.fabrication_results = None
                 st.error(f"Error processing DXF file: {e}")
             finally:
                 for path in [tmp_dxf_path, tmp_excel_path, tmp_shop_dxf_path, tmp_detail_dxf_path]:
-                    if os.path.exists(path):
+                    if path and os.path.exists(path):
                         os.remove(path)
+
+results = st.session_state.fabrication_results
+if results is not None:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Pieces", results["total_pieces"])
+    m2.metric("Total Net Area (m²)", f"{results['total_net_area']:.4f}")
+    m3.metric("Estimated Units", results["units_count"])
+    m4.metric("Estimated Wastage", f"{results['wastage_pct']:.2f}%")
+
+    tab1, tab2, tab3 = st.tabs([
+        "📋 Cutlist Schedule",
+        "📦 Sheets & Wastage",
+        "📥 Export Deliverables"
+    ])
+
+    with tab1:
+        st.dataframe(results["df_cutlist"], use_container_width=True, hide_index=True)
+
+    with tab2:
+        st.dataframe(results["df_summary"], use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.write("Download all generated deliverables without re-running the engine:")
+        d1, d2, d3 = st.columns(3)
+        res_mat = results["material_key"]
+
+        with d1:
+            st.download_button(
+                label="📊 Download Excel Cutlist (.xlsx)",
+                data=results["excel_bytes"],
+                file_name=f"Gafy_Cutlist_{res_mat}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="dl_excel_btn"
+            )
+
+        with d2:
+            st.download_button(
+                label="📐 Download Shop Drawing (.dxf)",
+                data=results["shop_dxf_bytes"],
+                file_name=f"Gafy_Tagged_ShopDrawing_{res_mat}.dxf",
+                mime="application/dxf",
+                use_container_width=True,
+                key="dl_shop_dxf_btn"
+            )
+
+        with d3:
+            st.download_button(
+                label="🗂️ Download Detail Sheets (.dxf)",
+                data=results["detail_dxf_bytes"],
+                file_name=f"Gafy_Detail_Sheets_{res_mat}.dxf",
+                mime="application/dxf",
+                use_container_width=True,
+                key="dl_detail_dxf_btn"
+            )
