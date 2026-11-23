@@ -159,6 +159,22 @@ cos_margin_val = st.sidebar.number_input(
     step=5.0
 )
 
+snap_tol_val = st.sidebar.number_input(
+    "Endpoint Snap Tolerance (mm)",
+    min_value=0.1,
+    max_value=50.0,
+    value=5.0,
+    step=0.5
+)
+
+min_area_val = st.sidebar.number_input(
+    "Minimum Panel Area (mm²)",
+    min_value=0.1,
+    max_value=10000.0,
+    value=1.0,
+    step=1.0
+)
+
 exclude_outer_frame = st.sidebar.checkbox(
     "Exclude Overall Outer Border",
     value=True
@@ -204,7 +220,7 @@ with left_col:
     custom_layer_input = st.text_input(
         "Target Material Layer Name (Overrides dropdown if entered)",
         value="" if selected_layer_dropdown == "All Layers" else selected_layer_dropdown,
-        placeholder="e.g., Marble 0.15"
+        placeholder="e.g., Marble 0.15 or MGIC - 015"
     )
 
 target_layer_value = custom_layer_input.strip() if custom_layer_input.strip() else None
@@ -216,11 +232,13 @@ with right_col:
     st.write(f"**Material:** {MATERIAL_OPTIONS[material_key]}")
     st.write(f"**Target Layer:** `{target_layer_value or 'All Layers'}`")
     st.write(f"**Kerf / COS:** `{kerf_val:.1f} mm` / `{cos_margin_val:.1f} mm`")
+    st.write(f"**Snap / Min Area:** `{snap_tol_val:.1f} mm` / `{min_area_val:.1f} mm²`")
 
 if uploaded_file is not None:
     current_sig = (
         f"{uploaded_file.name}_{uploaded_file.size}_{material_key}_{kerf_val}_"
-        f"{cos_margin_val}_{thickness_mm}_{bg_material}_{list_no}_{target_layer_value}_{exclude_outer_frame}"
+        f"{cos_margin_val}_{snap_tol_val}_{min_area_val}_{thickness_mm}_"
+        f"{bg_material}_{list_no}_{target_layer_value}_{exclude_outer_frame}"
     )
     if (
         st.session_state.fabrication_results is not None
@@ -252,6 +270,8 @@ if uploaded_file is not None:
                     custom_kerf=kerf_val,
                     target_layer=target_layer_value,
                     exclude_outer_frame=exclude_outer_frame,
+                    snap_tolerance=snap_tol_val,
+                    min_piece_area_mm2=min_area_val,
                     thickness_mm=thickness_mm,
                     cos_margin_mm=cos_margin_val,
                     background_material=bg_material,
@@ -304,7 +324,8 @@ if uploaded_file is not None:
                 else:
                     st.session_state.fabrication_results = None
                     st.warning(
-                        f"No closed panel boundaries were detected on layer '{target_layer_value or 'All Layers'}'."
+                        f"No closed panel boundaries were detected on layer '{target_layer_value or 'All Layers'}'. "
+                        "Try 'All Layers' or increase Endpoint Snap Tolerance (mm)."
                     )
 
             except Exception as e:
