@@ -279,7 +279,6 @@ class UnifiedFabricationEngine:
         min_area = float("inf")
         best_w, best_h, best_angle = 0.0, 0.0, 0.0
 
-        # Sample edge angles + 5-degree increments for robust minimum-wastage ABB
         candidate_angles = [float(a) for a in range(0, 90, 5)]
         n = len(pts)
         for i in range(n):
@@ -401,13 +400,12 @@ class UnifiedFabricationEngine:
 
         return closed_loops
 
-    @staticmethod
-    def _deduplicate_polygons(records: list, pos_tol: float = 2.0, area_tol: float = 0.03) -> list:
+    def _deduplicate_polygons(self, records: list, pos_tol: float = 2.0, area_tol: float = 0.03) -> list:
         """Remove near-duplicate closed polygons representing the same panel."""
         unique = []
         for rec in records:
             pts = rec["points"]
-            area = abs(UnifiedFabricationEngine._polygon_area(pts))
+            area = abs(self._polygon_area(pts))
             cx, cy = (
                 sum(p[0] for p in pts) / len(pts),
                 sum(p[1] for p in pts) / len(pts)
@@ -415,7 +413,7 @@ class UnifiedFabricationEngine:
             is_dup = False
             for existing in unique:
                 e_pts = existing["points"]
-                e_area = abs(UnifiedFabricationEngine._polygon_area(e_pts))
+                e_area = abs(self._polygon_area(e_pts))
                 e_cx, e_cy = (
                     sum(p[0] for p in e_pts) / len(e_pts),
                     sum(p[1] for p in e_pts) / len(e_pts)
@@ -512,7 +510,6 @@ class UnifiedFabricationEngine:
         kerf = float(self.profile["default_kerf_mm"])
         raw_records = []
 
-        # 1. Closed / near-closed LWPOLYLINE & POLYLINE entities
         for entity in self._collect_geometry_entities():
             etype = entity.dxftype()
             has_bulge = False
@@ -546,7 +543,6 @@ class UnifiedFabricationEngine:
                         "has_arcs": has_bulge
                     })
 
-        # 2. Closed CIRCLE / ELLIPSE panels
         for entity in self._collect_geometry_entities():
             if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
                 try:
@@ -563,7 +559,6 @@ class UnifiedFabricationEngine:
                 except Exception:
                     continue
 
-        # 3. Closed loops from separate LINE / ARC / SPLINE segments
         closed_loops = self._extract_closed_loops_from_lines_and_arcs(tolerance=self.snap_tolerance)
         for poly in closed_loops:
             raw_records.append({
@@ -953,7 +948,6 @@ class UnifiedFabricationEngine:
             s_min_x, s_max_x = min(s_xs), max(s_xs)
             s_min_y, s_max_y = min(s_ys), max(s_ys)
 
-            # ABB dashed box around scaled part
             abb_pts = [
                 (s_min_x, s_min_y),
                 (s_max_x, s_min_y),
@@ -966,7 +960,6 @@ class UnifiedFabricationEngine:
                 dxfattribs={"layer": "GAFY_ABB_CUTTING"}
             )
 
-            # 4-sided dimension labels (Top, Bottom, Left, Right)
             out_msp.add_text(
                 f"W: {piece['Net Width (mm)']} mm",
                 dxfattribs={
