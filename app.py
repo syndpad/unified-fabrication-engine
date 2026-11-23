@@ -1,5 +1,6 @@
 import os
 import tempfile
+import ezdxf
 import pandas as pd
 import streamlit as st
 from unified_engine_core import UnifiedFabricationEngine
@@ -25,6 +26,26 @@ def find_logo_file() -> str | None:
         if os.path.exists(candidate):
             return candidate
     return None
+
+
+def extract_dxf_layers_from_bytes(dxf_bytes: bytes) -> list:
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
+            tmp.write(dxf_bytes)
+            tmp_path = tmp.name
+        doc = ezdxf.readfile(tmp_path)
+        layers = {layer.dxf.name for layer in doc.layers if layer.dxf.name}
+        for ent in doc.modelspace():
+            l_name = getattr(ent.dxf, "layer", None)
+            if l_name:
+                layers.add(l_name)
+        return sorted(layers)
+    except Exception:
+        return []
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 logo_path = find_logo_file()
@@ -79,6 +100,13 @@ DEFAULT_KERFS = {
     "stainless_steel": 1.5
 }
 
+DEFAULT_LAYER_HINTS = {
+    "marble_granite": "Marble 0.15",
+    "mdf_wood": "Wood",
+    "aluminum_profile": "Aluminum",
+    "stainless_steel": "Steel"
+}
+
 if "fabrication_results" not in st.session_state:
     st.session_state.fabrication_results = None
 
@@ -108,7 +136,7 @@ with banner_left:
         f"""
         <div class="header-card">
             <h1>⚙️ {brand_name} — Unified Fabrication &amp; Cutlist Engine</h1>
-            <p>Automated DXF geometry extraction, line/arc merging, sheet estimation, shop drawings, and detail sheets export.</p>
+            <p>Automated DXF geometry extraction by material layer, line/arc merging, sheet estimation, shop drawings, and detail sheets export.</p>
         </div>
         """,
         unsafe_allow_html=True
@@ -119,17 +147,43 @@ with banner_right:
 
 left_col, right_col = st.columns([2, 1], gap="large")
 
+detected_layers = []
 with left_col:
     uploaded_file = st.file_uploader("Upload DXF Shop Drawing (.dxf)", type=["dxf"])
+    if uploaded_file is not None:
+        detected_layers = extract_dxf_layers_from_bytes(uploaded_file.getvalue())
+
+    layer_choices = ["All Layers"] + detected_layers
+    default_idx = 0
+    hint_name = DEFAULT_LAYER_HINTS.get(material_key, "")
+    for i, l_name in enumerate(layer_choices):
+        if hint_name and hint_name.lower() in l_name.lower():
+            default_idx = i
+            break
+
+    selected_layer_dropdown = st.selectbox(
+        "Detected DXF Layer (Optional)",
+        options=layer_choices,
+        index=default_idx
+    )
+
+    custom_layer_input = st.text_input(
+        "Target Material Layer Name (Overrides dropdown if entered)",
+        value="" if selected_layer_dropdown == "All Layers" else selected_layer_dropdown,
+        placeholder="e.g., Marble 0.15"
+    )
+
+target_layer_value = custom_layer_input.strip() if custom_layer_input.strip() else None
 
 with right_col:
     st.markdown("**Active Profile Summary**")
     st.write(f"**Brand:** {brand_name}")
     st.write(f"**Material:** {MATERIAL_OPTIONS[material_key]}")
+    st.write(f"**Target Layer:** `{target_layer_value or 'All Layers'}`")
     st.write(f"**Kerf:** `{kerf_val:.1f} mm`")
 
 if uploaded_file is not None:
-    current_sig = f"{uploaded_file.name}_{uploaded_file.size}_{material_key}_{kerf_val}"
+    current_sig = f"{uploaded_file.name}_{uploaded_file.size}_{material_key}_{kerf_val}_{target_layer_value}"
     if (
         st.session_state.fabrication_results is not None
         and st.session_state.fabrication_results.get("signature") != current_sig
@@ -139,7 +193,7 @@ if uploaded_file is not None:
     st.success(f"Loaded drawing: `{uploaded_file.name}`")
 
     if st.button("🚀 Run Fabrication Engine", type="primary"):
-        with st.spinner("Processing geometry, calculating sheets & wastage, and generating CAD/Excel deliverables..."):
+        with st.spinner("Processing target material layer, calculating sheets & wastage, and generating CAD/Excel deliverables..."):
             tmp_dxf_path = None
             tmp_excel_path = None
             tmp_shop_dxf_path = None
@@ -157,7 +211,8 @@ if uploaded_file is not None:
                 engine = UnifiedFabricationEngine(
                     dxf_path=tmp_dxf_path,
                     material_key=material_key,
-                    custom_kerf=kerf_val
+                    custom_kerf=kerf_val,
+                    target_layer=target_layer_value
                 )
                 pieces = engine.process_geometry()
                 summary = engine.calculate_sheets_and_wastage()
@@ -205,7 +260,9 @@ if uploaded_file is not None:
                     }
                 else:
                     st.session_state.fabrication_results = None
-                    st.warning("No closed geometric pieces were detected in the uploaded DXF file.")
+                    st.warning(
+                        f"No closed geometric pieces were detected on layer '{target_layer_value or 'All Layers'}'."
+                    )
 
             except Exception as e:
                 st.session_state.fabrication_results = None
