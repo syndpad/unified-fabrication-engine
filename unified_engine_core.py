@@ -10,6 +10,8 @@ class UnifiedFabricationEngine:
     """
     Unified Multi-Material Fabrication Core for Architectural Contracting
     Supports Marble & Granite, MDF & Wood Joinery, Architectural Metals, and Aluminum Profiles.
+    Extracts closed/curved geometry on the target layer, detects interior island boundaries,
+    and converts separated lines and curves into clean polylines.
     """
 
     DEFAULT_PROFILES = {
@@ -57,7 +59,8 @@ class UnifiedFabricationEngine:
         custom_kerf: float = None,
         target_layer: str | None = None,
         exclude_outer_frame: bool = False,
-        snap_tolerance: float = 3.0
+        snap_tolerance: float = 3.0,
+        include_separated_polylines: bool = True
     ):
         self.dxf_path = dxf_path
         self.material_key = material_key if material_key in self.DEFAULT_PROFILES else "marble_granite"
@@ -65,6 +68,7 @@ class UnifiedFabricationEngine:
         self.target_layer = target_layer.strip() if isinstance(target_layer, str) and target_layer.strip() else None
         self.exclude_outer_frame = exclude_outer_frame
         self.snap_tolerance = float(snap_tolerance)
+        self.include_separated_polylines = bool(include_separated_polylines)
 
         if custom_kerf is not None:
             self.profile["default_kerf_mm"] = float(custom_kerf)
@@ -72,6 +76,8 @@ class UnifiedFabricationEngine:
         self.doc = None
         self.msp = None
         self.extracted_pieces = []
+        self.separated_polylines = []
+        self.island_points = []
         self.summary_metrics = {}
 
     def load_dxf(self):
@@ -97,15 +103,25 @@ class UnifiedFabricationEngine:
                 layers.add(l_name)
         return sorted(layers)
 
-    def inspect_dxf_entities(self) -> dict:
-        """Return counts of entity types present in modelspace (filtered by target_layer if set)."""
-        if self.msp is None:
-            self.load_dxf()
-        counts = {}
-        for entity in self._collect_geometry_entities():
-            t = entity.dxftype()
-            counts[t] = counts.get(t, 0) + 1
-        return counts
+    def _layer_matches(self, entity) -> bool:
+        """Return True if no target layer is set or entity layer matches target_layer."""
+        if not self.target_layer:
+            return True
+        ent_layer = getattr(entity.dxf, "layer", "")
+        return ent_layer.strip().lower() == self.target_layer.lower()
+
+    def _collect_geometry_entities(self):
+        """Yield entities matching target_layer from modelspace and virtual INSERT entities."""
+        for entity in self.msp:
+            if self._layer_matches(entity):
+                yield entity
+            if entity.dxftype() == "INSERT":
+                try:
+                    for virtual_ent in entity.virtual_entities():
+                        if self._layer_matches(virtual_ent) or self._layer_matches(entity):
+                            yield virtual_ent
+                except Exception:
+                    continue
 
     @staticmethod
     def _clean_polygon_points(points: list, eps: float = 1e-3) -> list:
@@ -121,8 +137,65 @@ class UnifiedFabricationEngine:
             cleaned.pop()
         return cleaned
 
-    def _classify_shape(self, points: list) -> str:
-        """Classify closed detailed parts: Rectangle/Square, Triangle, Curved/Arc, or Custom Polygon."""
+    @staticmethod
+    def _point_in_polygon(pt: tuple, poly: list) -> bool:
+        """Ray-casting algorithm to test if an interior/island point lies inside a polygon."""
+        x, y = pt[0], pt[1]
+        inside = False
+        n = len(poly)
+        if n < 3:
+            return False
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i][0], poly[i][1]
+            xj, yj = poly[j][0], poly[j][1]
+            intersect = ((yi > y) != (yj > y)) and (
+                x < (xj - xi) * (y - yi) / ((yj - yi) if (yj - yi) != 0 else 1e-12) + xi
+            )
+            if intersect:
+                inside = not inside
+            j = i
+        return inside
+
+    def _pick_island_points_in_area(self, poly: list, grid_steps: int = 7) -> list:
+        """
+        Pick interior candidate points inside a closed area to detect enclosed islands
+        or inner sub-regions bounded by lines and curved arc lines.
+        """
+        pts = self._clean_polygon_points(poly)
+        if len(pts) < 3:
+            return []
+
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        if (max_x - min_x) <= 0 or (max_y - min_y) <= 0:
+            return []
+
+        picked = []
+        # Centroid check first
+        cx = sum(xs) / len(xs)
+        cy = sum(ys) / len(ys)
+        if self._point_in_polygon((cx, cy), pts):
+            picked.append((round(cx, 3), round(cy, 3)))
+
+        # Interior sampling grid for enclosed island detection
+        for gx in range(1, grid_steps):
+            px = min_x + (max_x - min_x) * (gx / grid_steps)
+            for gy in range(1, grid_steps):
+                py = min_y + (max_y - min_y) * (gy / grid_steps)
+                if self._point_in_polygon((px, py), pts):
+                    picked.append((round(px, 3), round(py, 3)))
+
+        return picked
+
+    def _classify_shape(self, points: list, is_island: bool = False) -> str:
+        """Classify closed parts: Island Boundary, Rectangle/Square, Triangle, Curved/Arc, or Custom."""
+        if is_island:
+            return "Island Boundary"
+
         pts = self._clean_polygon_points(points)
         if len(pts) < 3:
             return "Custom / Detail"
@@ -187,30 +260,44 @@ class UnifiedFabricationEngine:
             area -= pts[j][0] * pts[i][1]
         return abs(area) / 2.0
 
-    def _layer_matches(self, entity) -> bool:
-        """Return True if no target layer is set or entity layer matches target_layer."""
-        if not self.target_layer:
-            return True
-        ent_layer = getattr(entity.dxf, "layer", "")
-        return ent_layer.strip().lower() == self.target_layer.lower()
-
-    def _collect_geometry_entities(self):
-        """Yield entities matching target_layer from modelspace and exploded INSERT blocks."""
-        for entity in self.msp:
-            if self._layer_matches(entity):
-                yield entity
-            if entity.dxftype() == "INSERT":
+    def _collect_separated_line_and_curve_polylines(self) -> list:
+        """
+        Generate clean polyline point lists for all separated LINE, ARC, SPLINE,
+        CIRCLE, and ELLIPSE entities included in the selected target layer.
+        """
+        sep_polys = []
+        for entity in self._collect_geometry_entities():
+            etype = entity.dxftype()
+            if etype in ("LINE", "ARC", "SPLINE", "CIRCLE", "ELLIPSE"):
                 try:
-                    for virtual_ent in entity.virtual_entities():
-                        if self._layer_matches(virtual_ent) or self._layer_matches(entity):
-                            yield virtual_ent
+                    p = make_path(entity)
+                    pts = [(round(v.x, 3), round(v.y, 3)) for v in p.flattening(distance=0.5)]
+                    cleaned = self._clean_polygon_points(pts, eps=1e-3)
+                    if len(cleaned) >= 2:
+                        length_mm = sum(
+                            math.hypot(cleaned[i][0] - cleaned[i - 1][0], cleaned[i][1] - cleaned[i - 1][1])
+                            for i in range(1, len(cleaned))
+                        )
+                        is_closed_curve = etype in ("CIRCLE", "ELLIPSE") or (
+                            len(cleaned) >= 3
+                            and math.hypot(cleaned[0][0] - cleaned[-1][0], cleaned[0][1] - cleaned[-1][1]) <= self.snap_tolerance
+                        )
+                        if length_mm > 0.5:
+                            sep_polys.append({
+                                "entity_type": etype,
+                                "points": cleaned,
+                                "length_mm": round(length_mm, 2),
+                                "is_closed": is_closed_curve
+                            })
                 except Exception:
                     continue
+        return sep_polys
 
-    def _merge_loose_lines_and_arcs(self, tolerance: float = 3.0) -> list:
+    def _merge_loose_lines_and_arcs_with_islands(self, tolerance: float = 3.0) -> tuple:
         """
-        Build complete closed loops from LINE, ARC, and SPLINE segments on the
-        selected material layer using bi-directional endpoint snapping.
+        Merge lines and curved arc lines on the selected layer into closed boundaries,
+        and detect interior island boundaries by picking island points inside closed areas.
+        Returns (closed_boundaries_with_flags, all_island_points).
         """
         segments = []
         for entity in self._collect_geometry_entities():
@@ -290,33 +377,61 @@ class UnifiedFabricationEngine:
                 closed_loops.append(cleaned)
                 used_segments.update(chain_used)
 
-        return closed_loops
+        # Pick interior island points inside closed loops and identify nested island boundaries
+        all_island_pts = []
+        boundaries_out = []
+
+        for idx, poly in enumerate(closed_loops):
+            poly_area = self._polygon_area(poly)
+            island_pts = self._pick_island_points_in_area(poly, grid_steps=6)
+            all_island_pts.extend(island_pts)
+
+            # Check if this polygon lies inside a larger closed boundary (making it an island)
+            is_nested_island = False
+            for other_idx, other_poly in enumerate(closed_loops):
+                if other_idx == idx:
+                    continue
+                if self._polygon_area(other_poly) > poly_area * 1.05:
+                    sample_pt = poly[0]
+                    if self._point_in_polygon(sample_pt, other_poly):
+                        is_nested_island = True
+                        break
+
+            boundaries_out.append({
+                "source": "Island Line/Arc Boundary" if is_nested_island else "Closed Line/Arc Boundary",
+                "points": poly,
+                "is_island": is_nested_island,
+                "island_points": island_pts
+            })
+
+        return boundaries_out, all_island_pts
 
     @staticmethod
-    def _filter_outer_frame_if_needed(polygons_with_source: list) -> list:
+    def _filter_outer_frame_if_needed(records: list) -> list:
         """
         If an oversized outer border encloses several smaller pieces, remove the
-        enclosing outer frame so detailed inner parts remain cleanly isolated.
+        enclosing outer frame so detailed inner parts and islands remain isolated.
         """
-        if len(polygons_with_source) < 3:
-            return polygons_with_source
+        if len(records) < 3:
+            return records
 
         areas_and_boxes = []
-        for src, pts in polygons_with_source:
+        for rec in records:
+            pts = rec["points"]
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
             bbox = (min(xs), min(ys), max(xs), max(ys))
             bbox_area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 0.0)
-            areas_and_boxes.append((src, pts, bbox, bbox_area))
+            areas_and_boxes.append((rec, bbox, bbox_area))
 
-        max_entry = max(areas_and_boxes, key=lambda x: x[3])
-        _, _, max_box, max_area = max_entry
+        max_entry = max(areas_and_boxes, key=lambda x: x[2])
+        _, max_box, max_area = max_entry
 
         enclosed_count = 0
         for item in areas_and_boxes:
             if item is max_entry:
                 continue
-            _, _, b, _ = item
+            _, b, _ = item
             if (
                 b[0] >= max_box[0] - 1.0
                 and b[1] >= max_box[1] - 1.0
@@ -326,26 +441,25 @@ class UnifiedFabricationEngine:
                 enclosed_count += 1
 
         if enclosed_count >= 2 and max_area > 0:
-            return [
-                (src, pts)
-                for src, pts, _, _ in areas_and_boxes
-                if not (src == max_entry[0] and pts == max_entry[1])
-            ]
+            return [rec for rec, _, _ in areas_and_boxes if rec is not max_entry[0]]
 
-        return polygons_with_source
+        return records
 
     def process_geometry(self) -> list:
         """
-        Extract complete closed polylines, curves, and detailed LINE/ARC/SPLINE loops
-        for the target material layer, assign 3-digit tags (001, 002, ...),
-        and apply cutting kerf allowances.
+        Process the selected material layer to:
+        1) Detect closed lines and curved arc lines and form closed boundaries (including interior island points).
+        2) Generate polylines for all separated lines and curves in the selected layer.
+        3) Assign 3-digit tags (001, 002, ...) without circles and apply cutting kerf allowances.
         """
         if self.msp is None:
             self.load_dxf()
 
         kerf = float(self.profile["default_kerf_mm"])
-        raw_polygons = []
+        self.separated_polylines = self._collect_separated_line_and_curve_polylines()
+        raw_records = []
 
+        # 1. Closed / near-closed LWPOLYLINE & POLYLINE entities on selected layer
         for entity in self._collect_geometry_entities():
             etype = entity.dxftype()
             if etype in ("LWPOLYLINE", "POLYLINE"):
@@ -365,8 +479,14 @@ class UnifiedFabricationEngine:
                     and math.hypot(cleaned_pts[0][0] - cleaned_pts[-1][0], cleaned_pts[0][1] - cleaned_pts[-1][1]) <= self.snap_tolerance
                 )
                 if len(cleaned_pts) >= 3 and (is_closed_flag or near_closed) and self._polygon_area(cleaned_pts) > 0.5:
-                    raw_polygons.append(("Polyline Part", cleaned_pts))
+                    raw_records.append({
+                        "source": "Closed Polyline",
+                        "points": cleaned_pts,
+                        "is_island": False,
+                        "island_points": self._pick_island_points_in_area(cleaned_pts, grid_steps=5)
+                    })
 
+        # 2. Full CIRCLE / ELLIPSE entities on selected layer
         for entity in self._collect_geometry_entities():
             if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
                 try:
@@ -374,37 +494,74 @@ class UnifiedFabricationEngine:
                     pts = [(v.x, v.y) for v in p.flattening(distance=0.5)]
                     cleaned_pts = self._clean_polygon_points(pts)
                     if len(cleaned_pts) >= 6 and self._polygon_area(cleaned_pts) > 0.5:
-                        raw_polygons.append(("Curved Loop", cleaned_pts))
+                        raw_records.append({
+                            "source": "Closed Curved Loop",
+                            "points": cleaned_pts,
+                            "is_island": False,
+                            "island_points": self._pick_island_points_in_area(cleaned_pts, grid_steps=5)
+                        })
                 except Exception:
                     continue
 
-        merged_loops = self._merge_loose_lines_and_arcs(tolerance=self.snap_tolerance)
-        for pts in merged_loops:
-            cleaned_pts = self._clean_polygon_points(pts)
-            if len(cleaned_pts) >= 3 and self._polygon_area(cleaned_pts) > 0.5:
-                raw_polygons.append(("Detailed Line/Arc", cleaned_pts))
+        # 3. Closed line & curved arc boundaries + island point detection
+        merged_boundaries, all_islands = self._merge_loose_lines_and_arcs_with_islands(
+            tolerance=self.snap_tolerance
+        )
+        self.island_points = all_islands
+        raw_records.extend(merged_boundaries)
 
         if self.exclude_outer_frame:
-            raw_polygons = self._filter_outer_frame_if_needed(raw_polygons)
+            raw_records = self._filter_outer_frame_if_needed(raw_records)
+
+        # 4. Also include separated lines/curves as generated polylines if enabled
+        if self.include_separated_polylines:
+            for sep in self.separated_polylines:
+                if not sep["is_closed"] and len(sep["points"]) >= 2:
+                    pts = sep["points"]
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    w_box = round(max(xs) - min(xs), 2)
+                    h_box = round(max(ys) - min(ys), 2)
+                    if max(w_box, h_box) > 0:
+                        raw_records.append({
+                            "source": f"Separated {sep['entity_type']} Polyline",
+                            "points": pts,
+                            "is_island": False,
+                            "island_points": [],
+                            "override_len": max(w_box, h_box),
+                            "override_wid": min(w_box, h_box) if min(w_box, h_box) > 0 else sep["length_mm"],
+                            "override_area_m2": 0.0,
+                            "shape_override": "Separated Curve/Line"
+                        })
 
         layer_label = self.target_layer if self.target_layer else "All Layers"
         self.extracted_pieces = []
-        for idx, (source_type, pts) in enumerate(raw_polygons, start=1):
-            net_len, net_wid = self._get_min_wastage_bbox(pts)
-            net_area_m2 = self._polygon_area(pts) / 1_000_000.0
+
+        for idx, rec in enumerate(raw_records, start=1):
+            pts = rec["points"]
+            if "override_len" in rec:
+                net_len = rec["override_len"]
+                net_wid = rec["override_wid"]
+                net_area_m2 = rec.get("override_area_m2", 0.0)
+                shape_type = rec.get("shape_override", "Separated Curve/Line")
+            else:
+                net_len, net_wid = self._get_min_wastage_bbox(pts)
+                net_area_m2 = self._polygon_area(pts) / 1_000_000.0
+                shape_type = self._classify_shape(pts, is_island=rec.get("is_island", False))
 
             cut_len = round(net_len + kerf, 2)
             cut_wid = round(net_wid + kerf, 2)
             gross_bbox_area_m2 = (cut_len * cut_wid) / 1_000_000.0
-            shape_type = self._classify_shape(pts)
+            isl_pts = rec.get("island_points", [])
 
             if net_len > 0 and net_wid > 0:
                 self.extracted_pieces.append({
                     "Tag": f"{idx:03d}",
                     "Material": self.profile["name"],
                     "Target Layer": layer_label,
-                    "Source Entity": source_type,
+                    "Source Entity": rec["source"],
                     "Shape Type": shape_type,
+                    "Island Points Count": len(isl_pts),
                     "Net Length (mm)": net_len,
                     "Net Width (mm)": net_wid,
                     "Cut Length + Kerf (mm)": cut_len,
@@ -423,6 +580,7 @@ class UnifiedFabricationEngine:
 
         total_pieces = len(self.extracted_pieces)
         detail_pieces = sum(1 for p in self.extracted_pieces if p.get("Shape Type") != "Standard Rect")
+        island_pieces = sum(1 for p in self.extracted_pieces if p.get("Shape Type") == "Island Boundary")
         total_net_area = sum(p["Net Area (m2)"] for p in self.extracted_pieces)
         total_gross_bbox_area = sum(p["Gross BBox Area (m2)"] for p in self.extracted_pieces)
         layer_label = self.target_layer if self.target_layer else "All Layers"
@@ -446,8 +604,10 @@ class UnifiedFabricationEngine:
             self.summary_metrics = {
                 "Material Profile": self.profile["name"],
                 "Target Layer": layer_label,
-                "Total Pieces": total_pieces,
+                "Total Pieces / Polylines": total_pieces,
                 "Detail Sheet Pieces": detail_pieces,
+                "Island Boundaries Detected": island_pieces,
+                "Separated Curves/Lines Converted": len(self.separated_polylines),
                 "Standard Sheet Size (mm)": f"{int(sheet_l)} x {int(sheet_w)}",
                 "Single Sheet Area (m2)": round(single_sheet_area_m2, 3),
                 "Total Net Area (m2)": round(total_net_area, 3),
@@ -470,8 +630,10 @@ class UnifiedFabricationEngine:
             self.summary_metrics = {
                 "Material Profile": self.profile["name"],
                 "Target Layer": layer_label,
-                "Total Pieces": total_pieces,
+                "Total Pieces / Polylines": total_pieces,
                 "Detail Sheet Pieces": detail_pieces,
+                "Island Boundaries Detected": island_pieces,
+                "Separated Curves/Lines Converted": len(self.separated_polylines),
                 "Standard Bar Length (mm)": int(bar_len),
                 "Total Cut Length (m)": round(total_linear_mm / 1000.0, 2),
                 "Estimated Bars Required": estimated_bars,
@@ -529,8 +691,8 @@ class UnifiedFabricationEngine:
 
     def export_processed_dxf(self, output_dxf_path: str = "Processed_Tagged_Drawing.dxf") -> str:
         """
-        Save a clean DXF shop drawing containing closed polylines and
-        3-digit tags (001, 002, ...) without circles in dedicated layers.
+        Save a clean DXF shop drawing containing closed boundaries, generated polylines
+        for lines/curves on the selected layer, island points, and 3-digit tags (001, 002, ...).
         """
         if not self.extracted_pieces:
             self.process_geometry()
@@ -541,21 +703,31 @@ class UnifiedFabricationEngine:
 
         out_msp = out_doc.modelspace()
 
-        if "GAFY_CUT_POLYLINES" not in out_doc.layers:
-            out_doc.layers.add("GAFY_CUT_POLYLINES", color=3)
-        if "GAFY_PART_TAGS" not in out_doc.layers:
-            out_doc.layers.add("GAFY_PART_TAGS", color=2)
+        for layer_name, color_idx in [
+            ("GAFY_CUT_POLYLINES", 3),
+            ("GAFY_PART_TAGS", 2),
+            ("GAFY_ISLAND_POINTS", 1),
+            ("GAFY_SEPARATED_CURVES", 5)
+        ]:
+            if layer_name not in out_doc.layers:
+                out_doc.layers.add(layer_name, color=color_idx)
+
+        for ipt in self.island_points:
+            out_msp.add_point((float(ipt[0]), float(ipt[1])), dxfattribs={"layer": "GAFY_ISLAND_POINTS"})
 
         written_count = 0
         for piece in self.extracted_pieces:
             pts = self._clean_polygon_points(piece.get("Polygon Points", []))
-            if len(pts) < 3:
+            if len(pts) < 2:
                 continue
+
+            is_closed_poly = len(pts) >= 3 and piece.get("Shape Type") != "Separated Curve/Line"
+            target_dxf_layer = "GAFY_CUT_POLYLINES" if is_closed_poly else "GAFY_SEPARATED_CURVES"
 
             out_msp.add_lwpolyline(
                 pts,
-                close=True,
-                dxfattribs={"layer": "GAFY_CUT_POLYLINES"}
+                close=is_closed_poly,
+                dxfattribs={"layer": target_dxf_layer}
             )
 
             cx = sum(p[0] for p in pts) / len(pts)
@@ -574,7 +746,7 @@ class UnifiedFabricationEngine:
             written_count += 1
 
         if written_count == 0:
-            raise ValueError("No valid closed polygons available to export to DXF.")
+            raise ValueError("No valid polylines or closed boundaries available to export to DXF.")
 
         out_doc.saveas(output_dxf_path)
         return output_dxf_path
@@ -589,8 +761,8 @@ class UnifiedFabricationEngine:
         include_all_if_no_custom: bool = True
     ) -> str:
         """
-        Generate dedicated Detail Sheets in DXF for detailed/custom/non-rectangular
-        pieces with frame borders, 3-digit tags (no circles), and overall dimensions.
+        Generate dedicated Detail Sheets in DXF for detailed/custom/island/curved
+        pieces with frame borders, 3-digit tags (no circles), and dimensions.
         """
         if not self.extracted_pieces:
             self.process_geometry()
@@ -656,7 +828,7 @@ class UnifiedFabricationEngine:
                 )
 
             pts = self._clean_polygon_points(piece.get("Polygon Points", []))
-            if len(pts) < 3:
+            if len(pts) < 2:
                 continue
 
             min_x = min(p[0] for p in pts)
@@ -681,9 +853,10 @@ class UnifiedFabricationEngine:
                 for p in pts
             ]
 
+            is_closed_poly = len(scaled_pts) >= 3 and piece.get("Shape Type") != "Separated Curve/Line"
             out_msp.add_lwpolyline(
                 scaled_pts,
-                close=True,
+                close=is_closed_poly,
                 dxfattribs={"layer": "GAFY_DETAIL_GEOMETRY"}
             )
 
