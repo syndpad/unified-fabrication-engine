@@ -55,12 +55,14 @@ class UnifiedFabricationEngine:
         dxf_path: str,
         material_key: str = "marble_granite",
         custom_kerf: float = None,
+        target_layer: str | None = None,
         exclude_outer_frame: bool = False,
         snap_tolerance: float = 3.0
     ):
         self.dxf_path = dxf_path
         self.material_key = material_key if material_key in self.DEFAULT_PROFILES else "marble_granite"
         self.profile = self.DEFAULT_PROFILES[self.material_key].copy()
+        self.target_layer = target_layer.strip() if isinstance(target_layer, str) and target_layer.strip() else None
         self.exclude_outer_frame = exclude_outer_frame
         self.snap_tolerance = float(snap_tolerance)
 
@@ -80,12 +82,27 @@ class UnifiedFabricationEngine:
         self.doc = ezdxf.readfile(self.dxf_path)
         self.msp = self.doc.modelspace()
 
+    def get_available_layers(self) -> list:
+        """Return sorted list of layer names present in the DXF file."""
+        if self.msp is None:
+            self.load_dxf()
+
+        layers = set()
+        for layer in self.doc.layers:
+            if layer.dxf.name:
+                layers.add(layer.dxf.name)
+        for entity in self.msp:
+            l_name = getattr(entity.dxf, "layer", None)
+            if l_name:
+                layers.add(l_name)
+        return sorted(layers)
+
     def inspect_dxf_entities(self) -> dict:
-        """Return counts of entity types present in modelspace for quick diagnostics."""
+        """Return counts of entity types present in modelspace (filtered by target_layer if set)."""
         if self.msp is None:
             self.load_dxf()
         counts = {}
-        for entity in self.msp:
+        for entity in self._collect_geometry_entities():
             t = entity.dxftype()
             counts[t] = counts.get(t, 0) + 1
         return counts
@@ -170,21 +187,30 @@ class UnifiedFabricationEngine:
             area -= pts[j][0] * pts[i][1]
         return abs(area) / 2.0
 
+    def _layer_matches(self, entity) -> bool:
+        """Return True if no target layer is set or entity layer matches target_layer."""
+        if not self.target_layer:
+            return True
+        ent_layer = getattr(entity.dxf, "layer", "")
+        return ent_layer.strip().lower() == self.target_layer.lower()
+
     def _collect_geometry_entities(self):
-        """Yield modelspace entities and virtual entities from exploded INSERT blocks."""
+        """Yield entities matching target_layer from modelspace and exploded INSERT blocks."""
         for entity in self.msp:
-            yield entity
+            if self._layer_matches(entity):
+                yield entity
             if entity.dxftype() == "INSERT":
                 try:
                     for virtual_ent in entity.virtual_entities():
-                        yield virtual_ent
+                        if self._layer_matches(virtual_ent) or self._layer_matches(entity):
+                            yield virtual_ent
                 except Exception:
                     continue
 
     def _merge_loose_lines_and_arcs(self, tolerance: float = 3.0) -> list:
         """
-        Build complete closed loops from LINE, ARC, and SPLINE segments using
-        bi-directional endpoint snapping so inner shapes close reliably.
+        Build complete closed loops from LINE, ARC, and SPLINE segments on the
+        selected material layer using bi-directional endpoint snapping.
         """
         segments = []
         for entity in self._collect_geometry_entities():
@@ -224,7 +250,6 @@ class UnifiedFabricationEngine:
                     if cand_idx in chain_used:
                         continue
 
-                    # Match at tail of chain
                     d_tail_start = dist(chain[-1], seg[0])
                     if d_tail_start <= best_dist:
                         best_dist = d_tail_start
@@ -235,7 +260,6 @@ class UnifiedFabricationEngine:
                         best_dist = d_tail_end
                         best_match = ("tail", cand_idx, list(reversed(seg[:-1])))
 
-                    # Match at head of chain
                     d_head_end = dist(chain[0], seg[-1])
                     if d_head_end <= best_dist:
                         best_dist = d_head_end
@@ -312,8 +336,9 @@ class UnifiedFabricationEngine:
 
     def process_geometry(self) -> list:
         """
-        Extract complete closed polylines, curves, and detailed inner LINE/ARC/SPLINE loops,
-        assign 3-digit tags (001, 002, ...), and apply cutting kerf allowances.
+        Extract complete closed polylines, curves, and detailed LINE/ARC/SPLINE loops
+        for the target material layer, assign 3-digit tags (001, 002, ...),
+        and apply cutting kerf allowances.
         """
         if self.msp is None:
             self.load_dxf()
@@ -321,7 +346,6 @@ class UnifiedFabricationEngine:
         kerf = float(self.profile["default_kerf_mm"])
         raw_polygons = []
 
-        # 1. Closed or near-closed LWPOLYLINE / POLYLINE entities
         for entity in self._collect_geometry_entities():
             etype = entity.dxftype()
             if etype in ("LWPOLYLINE", "POLYLINE"):
@@ -343,7 +367,6 @@ class UnifiedFabricationEngine:
                 if len(cleaned_pts) >= 3 and (is_closed_flag or near_closed) and self._polygon_area(cleaned_pts) > 0.5:
                     raw_polygons.append(("Polyline Part", cleaned_pts))
 
-        # 2. Full CIRCLE / ELLIPSE entities
         for entity in self._collect_geometry_entities():
             if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
                 try:
@@ -355,7 +378,6 @@ class UnifiedFabricationEngine:
                 except Exception:
                     continue
 
-        # 3. Completed closed loops from LINE, ARC, and SPLINE segments
         merged_loops = self._merge_loose_lines_and_arcs(tolerance=self.snap_tolerance)
         for pts in merged_loops:
             cleaned_pts = self._clean_polygon_points(pts)
@@ -365,6 +387,7 @@ class UnifiedFabricationEngine:
         if self.exclude_outer_frame:
             raw_polygons = self._filter_outer_frame_if_needed(raw_polygons)
 
+        layer_label = self.target_layer if self.target_layer else "All Layers"
         self.extracted_pieces = []
         for idx, (source_type, pts) in enumerate(raw_polygons, start=1):
             net_len, net_wid = self._get_min_wastage_bbox(pts)
@@ -379,6 +402,7 @@ class UnifiedFabricationEngine:
                 self.extracted_pieces.append({
                     "Tag": f"{idx:03d}",
                     "Material": self.profile["name"],
+                    "Target Layer": layer_label,
                     "Source Entity": source_type,
                     "Shape Type": shape_type,
                     "Net Length (mm)": net_len,
@@ -401,6 +425,7 @@ class UnifiedFabricationEngine:
         detail_pieces = sum(1 for p in self.extracted_pieces if p.get("Shape Type") != "Standard Rect")
         total_net_area = sum(p["Net Area (m2)"] for p in self.extracted_pieces)
         total_gross_bbox_area = sum(p["Gross BBox Area (m2)"] for p in self.extracted_pieces)
+        layer_label = self.target_layer if self.target_layer else "All Layers"
 
         if self.profile["mode"] == "plate_2d":
             sheet_l = float(self.profile["sheet_length_mm"])
@@ -420,6 +445,7 @@ class UnifiedFabricationEngine:
 
             self.summary_metrics = {
                 "Material Profile": self.profile["name"],
+                "Target Layer": layer_label,
                 "Total Pieces": total_pieces,
                 "Detail Sheet Pieces": detail_pieces,
                 "Standard Sheet Size (mm)": f"{int(sheet_l)} x {int(sheet_w)}",
@@ -443,6 +469,7 @@ class UnifiedFabricationEngine:
 
             self.summary_metrics = {
                 "Material Profile": self.profile["name"],
+                "Target Layer": layer_label,
                 "Total Pieces": total_pieces,
                 "Detail Sheet Pieces": detail_pieces,
                 "Standard Bar Length (mm)": int(bar_len),
@@ -563,8 +590,7 @@ class UnifiedFabricationEngine:
     ) -> str:
         """
         Generate dedicated Detail Sheets in DXF for detailed/custom/non-rectangular
-        pieces (triangles, curves/arcs, custom profiles) with frame borders,
-        3-digit tags (no circles), and overall dimensions.
+        pieces with frame borders, 3-digit tags (no circles), and overall dimensions.
         """
         if not self.extracted_pieces:
             self.process_geometry()
@@ -621,7 +647,7 @@ class UnifiedFabricationEngine:
                     dxfattribs={"layer": "GAFY_SHEET_FRAME"}
                 )
                 out_msp.add_text(
-                    f"DETAIL SHEET {sheet_idx + 1:02d} | {self.profile['name']}",
+                    f"DETAIL SHEET {sheet_idx + 1:02d} | {self.profile['name']} | {piece.get('Target Layer', 'All Layers')}",
                     dxfattribs={
                         "layer": "GAFY_DETAIL_DIMS",
                         "height": 22.0,
