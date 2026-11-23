@@ -100,6 +100,13 @@ DEFAULT_KERFS = {
     "stainless_steel": 1.5
 }
 
+DEFAULT_BG_MATERIALS = {
+    "marble_granite": "Burdur Beige Polished",
+    "mdf_wood": "MDF Melamine Board",
+    "aluminum_profile": "Anodized Aluminum Profile",
+    "stainless_steel": "Brushed Stainless Steel 304"
+}
+
 DEFAULT_LAYER_HINTS = {
     "marble_granite": "Marble 0.15",
     "mdf_wood": "Wood",
@@ -115,11 +122,25 @@ if logo_path:
 
 st.sidebar.header("Brand & Fabrication Controls")
 brand_name = st.sidebar.text_input("Brand Name", value="Gafy AI Engine")
+list_no = st.sidebar.text_input("Cutting List No.", value="D20899")
 
 material_key = st.sidebar.selectbox(
     "Material Profile",
     options=list(MATERIAL_OPTIONS.keys()),
     format_func=lambda k: MATERIAL_OPTIONS[k]
+)
+
+bg_material = st.sidebar.text_input(
+    "Background Material",
+    value=DEFAULT_BG_MATERIALS.get(material_key, "Burdur Beige Polished")
+)
+
+thickness_mm = st.sidebar.number_input(
+    "Thickness Th (mm)",
+    min_value=1,
+    max_value=150,
+    value=20,
+    step=1
 )
 
 kerf_val = st.sidebar.number_input(
@@ -130,13 +151,26 @@ kerf_val = st.sidebar.number_input(
     step=0.5
 )
 
+cos_margin_val = st.sidebar.number_input(
+    "Perimeter COS Margin (mm)",
+    min_value=0.0,
+    max_value=250.0,
+    value=50.0,
+    step=5.0
+)
+
+exclude_outer_frame = st.sidebar.checkbox(
+    "Exclude Overall Outer Border",
+    value=True
+)
+
 banner_left, banner_right = st.columns([5, 1], vertical_alignment="center")
 with banner_left:
     st.markdown(
         f"""
         <div class="header-card">
-            <h1>⚙️ {brand_name} — Unified Fabrication &amp; Cutlist Engine</h1>
-            <p>Automated DXF geometry extraction by material layer, line/arc merging, sheet estimation, shop drawings, and detail sheets export.</p>
+            <h1>⚙️ {brand_name} — Unified Fabrication & Cutlist Engine</h1>
+            <p>Automated DXF geometry extraction by material layer, COS & detail-sheet classification, ABB rotation, and Excel/DXF deliverables.</p>
         </div>
         """,
         unsafe_allow_html=True
@@ -178,12 +212,16 @@ target_layer_value = custom_layer_input.strip() if custom_layer_input.strip() el
 with right_col:
     st.markdown("**Active Profile Summary**")
     st.write(f"**Brand:** {brand_name}")
+    st.write(f"**List No.:** `{list_no}`")
     st.write(f"**Material:** {MATERIAL_OPTIONS[material_key]}")
     st.write(f"**Target Layer:** `{target_layer_value or 'All Layers'}`")
-    st.write(f"**Kerf:** `{kerf_val:.1f} mm`")
+    st.write(f"**Kerf / COS:** `{kerf_val:.1f} mm` / `{cos_margin_val:.1f} mm`")
 
 if uploaded_file is not None:
-    current_sig = f"{uploaded_file.name}_{uploaded_file.size}_{material_key}_{kerf_val}_{target_layer_value}"
+    current_sig = (
+        f"{uploaded_file.name}_{uploaded_file.size}_{material_key}_{kerf_val}_"
+        f"{cos_margin_val}_{thickness_mm}_{bg_material}_{list_no}_{target_layer_value}_{exclude_outer_frame}"
+    )
     if (
         st.session_state.fabrication_results is not None
         and st.session_state.fabrication_results.get("signature") != current_sig
@@ -193,7 +231,7 @@ if uploaded_file is not None:
     st.success(f"Loaded drawing: `{uploaded_file.name}`")
 
     if st.button("🚀 Run Fabrication Engine", type="primary"):
-        with st.spinner("Processing target material layer, calculating sheets & wastage, and generating CAD/Excel deliverables..."):
+        with st.spinner("Processing target layer, classifying COS & detail sheets, and generating Excel/DXF deliverables..."):
             tmp_dxf_path = None
             tmp_excel_path = None
             tmp_shop_dxf_path = None
@@ -212,7 +250,12 @@ if uploaded_file is not None:
                     dxf_path=tmp_dxf_path,
                     material_key=material_key,
                     custom_kerf=kerf_val,
-                    target_layer=target_layer_value
+                    target_layer=target_layer_value,
+                    exclude_outer_frame=exclude_outer_frame,
+                    thickness_mm=thickness_mm,
+                    cos_margin_mm=cos_margin_val,
+                    background_material=bg_material,
+                    list_no=list_no
                 )
                 pieces = engine.process_geometry()
                 summary = engine.calculate_sheets_and_wastage()
@@ -261,7 +304,7 @@ if uploaded_file is not None:
                 else:
                     st.session_state.fabrication_results = None
                     st.warning(
-                        f"No closed geometric pieces were detected on layer '{target_layer_value or 'All Layers'}'."
+                        f"No closed panel boundaries were detected on layer '{target_layer_value or 'All Layers'}'."
                     )
 
             except Exception as e:
@@ -275,7 +318,7 @@ if uploaded_file is not None:
 results = st.session_state.fabrication_results
 if results is not None:
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Pieces", results["total_pieces"])
+    m1.metric("Total Panels", results["total_pieces"])
     m2.metric("Total Net Area (m²)", f"{results['total_net_area']:.4f}")
     m3.metric("Estimated Units", results["units_count"])
     m4.metric("Estimated Wastage", f"{results['wastage_pct']:.2f}%")
@@ -301,7 +344,7 @@ if results is not None:
             st.download_button(
                 label="📊 Download Excel Cutlist (.xlsx)",
                 data=results["excel_bytes"],
-                file_name=f"Gafy_Cutlist_{res_mat}.xlsx",
+                file_name=f"{list_no}_Cutlist_{res_mat}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key="dl_excel_btn"
@@ -311,7 +354,7 @@ if results is not None:
             st.download_button(
                 label="📐 Download Shop Drawing (.dxf)",
                 data=results["shop_dxf_bytes"],
-                file_name=f"Gafy_Tagged_ShopDrawing_{res_mat}.dxf",
+                file_name=f"{list_no}_Tagged_ShopDrawing_{res_mat}.dxf",
                 mime="application/dxf",
                 use_container_width=True,
                 key="dl_shop_dxf_btn"
@@ -321,7 +364,7 @@ if results is not None:
             st.download_button(
                 label="🗂️ Download Detail Sheets (.dxf)",
                 data=results["detail_dxf_bytes"],
-                file_name=f"Gafy_Detail_Sheets_{res_mat}.dxf",
+                file_name=f"{list_no}_Detail_Sheets_{res_mat}.dxf",
                 mime="application/dxf",
                 use_container_width=True,
                 key="dl_detail_dxf_btn"
