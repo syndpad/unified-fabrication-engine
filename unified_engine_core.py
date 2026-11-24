@@ -10,9 +10,8 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 class UnifiedFabricationEngine:
     """
     Unified Multi-Material Fabrication Core for Architectural Contracting.
-    Extracts individual closed tile/panel boundaries on the target layer rather than
-    the overall tiles-area outline border, with ABB rotation, COS margins,
-    3-digit tags (no circles), and Excel/DXF deliverables.
+    Splits intersecting/crossing lines and curves in 2D to extract individual
+    closed tile/panel boundaries on the target layer, avoiding outer borders.
     """
 
     DEFAULT_PROFILES = {
@@ -62,6 +61,8 @@ class UnifiedFabricationEngine:
         exclude_outer_frame: bool = True,
         snap_tolerance: float = 2.0,
         min_piece_area_mm2: float = 25.0,
+        max_chain_steps: int = 24,
+        outer_area_ratio_threshold: float = 1.65,
         thickness_mm: int = 20,
         cos_margin_mm: float = 50.0,
         perimeter_band_mm: float = 80.0,
@@ -77,6 +78,8 @@ class UnifiedFabricationEngine:
         self.exclude_outer_frame = bool(exclude_outer_frame)
         self.snap_tolerance = float(snap_tolerance)
         self.min_piece_area_mm2 = float(min_piece_area_mm2)
+        self.max_chain_steps = max(4, int(max_chain_steps))
+        self.outer_area_ratio_threshold = float(outer_area_ratio_threshold)
         self.thickness_mm = int(thickness_mm)
         self.cos_margin_mm = float(cos_margin_mm)
         self.perimeter_band_mm = float(perimeter_band_mm)
@@ -91,7 +94,6 @@ class UnifiedFabricationEngine:
         self.doc = None
         self.msp = None
         self.extracted_pieces = []
-        self.seed_probe_points = []
         self.summary_metrics = {}
 
     def load_dxf(self):
@@ -187,38 +189,6 @@ class UnifiedFabricationEngine:
             sum(p[1] for p in pts) / len(pts)
         )
 
-    @staticmethod
-    def _point_in_polygon(pt: tuple, poly: list) -> bool:
-        """Ray-casting test for whether a point lies inside a closed polygon."""
-        x, y = pt[0], pt[1]
-        inside = False
-        n = len(poly)
-        if n < 3:
-            return False
-        j = n - 1
-        for i in range(n):
-            xi, yi = poly[i][0], poly[i][1]
-            xj, yj = poly[j][0], poly[j][1]
-            denom = (yj - yi)
-            if abs(denom) < 1e-12:
-                denom = 1e-12
-            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / denom + xi):
-                inside = not inside
-            j = i
-        return inside
-
-    @staticmethod
-    def _cluster_coords(values: list, tol: float = 15.0) -> list:
-        """Cluster sorted coordinate values within tolerance."""
-        if not values:
-            return []
-        clustered = [float(values[0])]
-        for val in values[1:]:
-            val_f = float(val)
-            if val_f - clustered[-1] > tol:
-                clustered.append(val_f)
-        return clustered
-
     def _get_min_wastage_bbox_and_angle(self, points: list) -> tuple:
         """
         Calculate minimum-area bounding box (length, width) and optimal rotation angle
@@ -256,165 +226,186 @@ class UnifiedFabricationEngine:
 
         return round(best_w, 2), round(best_h, 2), best_angle
 
-    def _extract_grid_cell_polygons(self, segments: list, cluster_tol: float = 15.0) -> list:
+    @staticmethod
+    def _segment_intersection_2d(a1: tuple, a2: tuple, b1: tuple, b2: tuple, eps: float = 1e-4) -> tuple | None:
+        """Return intersection point (x, y) of 2D segments a1-a2 and b1-b2 if they cross/touch."""
+        x1, y1 = a1
+        x2, y2 = a2
+        x3, y3 = b1
+        x4, y4 = b2
+
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1e-12:
+            return None
+
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom
+
+        if -eps <= t <= 1.0 + eps and -eps <= u <= 1.0 + eps:
+            ix = x1 + max(0.0, min(1.0, t)) * (x2 - x1)
+            iy = y1 + max(0.0, min(1.0, t)) * (y2 - y1)
+            return (round(ix, 3), round(iy, 3))
+        return None
+
+    def _split_intersecting_polylines(self, polylines: list) -> list:
         """
-        Detect individual rectangular/grid tile cells formed by horizontal and vertical
-        lines/segments when lines share grid coordinates across a tiled layout.
+        Split polylines/segments at all 2D intersection points with other segments
+        so crossing lines and curves break cleanly at tile boundaries.
         """
-        h_lines = []
-        v_lines = []
-        for seg in segments:
-            if len(seg) < 2:
-                continue
-            p1, p2 = seg[0], seg[-1]
-            dx = abs(p2[0] - p1[0])
-            dy = abs(p2[1] - p1[1])
-            if dy <= cluster_tol and dx > cluster_tol:
-                y_val = (p1[1] + p2[1]) * 0.5
-                h_lines.append((y_val, min(p1[0], p2[0]), max(p1[0], p2[0])))
-            elif dx <= cluster_tol and dy > cluster_tol:
-                x_val = (p1[0] + p2[0]) * 0.5
-                v_lines.append((x_val, min(p1[1], p2[1]), max(p1[1], p2[1])))
+        sub_segs = []
+        for poly in polylines:
+            for i in range(len(poly) - 1):
+                p1, p2 = poly[i], poly[i + 1]
+                if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) > 1e-2:
+                    sub_segs.append([p1, p2])
 
-        if len(h_lines) < 2 or len(v_lines) < 2:
-            return []
+        n_segs = len(sub_segs)
+        split_pts_per_seg = [[s[0], s[1]] for s in sub_segs]
 
-        xs = self._cluster_coords(sorted([v[0] for v in v_lines]), tol=cluster_tol)
-        ys = self._cluster_coords(sorted([h[0] for h in h_lines]), tol=cluster_tol)
+        for i in range(n_segs):
+            a1, a2 = sub_segs[i][0], sub_segs[i][1]
+            ax0, ax1 = min(a1[0], a2[0]), max(a1[0], a2[0])
+            ay0, ay1 = min(a1[1], a2[1]), max(a1[1], a2[1])
 
-        if len(xs) < 2 or len(ys) < 2:
-            return []
+            for j in range(i + 1, n_segs):
+                b1, b2 = sub_segs[j][0], sub_segs[j][1]
+                bx0, bx1 = min(b1[0], b2[0]), max(b1[0], b2[0])
+                by0, by1 = min(b1[1], b2[1]), max(b1[1], b2[1])
 
-        def has_h_span(y_coord, x_start, x_end):
-            for hy, hx0, hx1 in h_lines:
-                if abs(hy - y_coord) <= cluster_tol and hx0 <= x_start + cluster_tol and hx1 >= x_end - cluster_tol:
-                    return True
-            return False
-
-        def has_v_span(x_coord, y_start, y_end):
-            for vx, vy0, vy1 in v_lines:
-                if abs(vx - x_coord) <= cluster_tol and vy0 <= y_start + cluster_tol and vy1 >= y_end - cluster_tol:
-                    return True
-            return False
-
-        cell_polys = []
-        for i in range(len(xs) - 1):
-            x0, x1 = xs[i], xs[i + 1]
-            if (x1 - x0) < 20.0:
-                continue
-            for j in range(len(ys) - 1):
-                y0, y1 = ys[j], ys[j + 1]
-                if (y1 - y0) < 20.0:
-                    continue
-                if (
-                    has_h_span(y0, x0, x1)
-                    and has_h_span(y1, x0, x1)
-                    and has_v_span(x0, y0, y1)
-                    and has_v_span(x1, y0, y1)
-                ):
-                    area = (x1 - x0) * (y1 - y0)
-                    if area >= self.min_piece_area_mm2:
-                        cell_polys.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
-
-        return cell_polys
-
-    def _extract_closed_loops_from_lines_and_arcs(self, tolerance: float = 2.0) -> list:
-        """
-        Extract individual closed tile/panel boundaries from separate LINE, ARC,
-        and SPLINE segments on the selected layer without collapsing into the outer border.
-        """
-        segments = []
-        for entity in self._collect_geometry_entities():
-            if entity.dxftype() in ("LINE", "ARC", "SPLINE"):
-                try:
-                    p = make_path(entity)
-                    pts = [(round(v.x, 3), round(v.y, 3)) for v in p.flattening(distance=0.5)]
-                    cleaned = self._clean_polygon_points(pts, eps=1e-3)
-                    if len(cleaned) >= 2:
-                        seg_len = sum(
-                            math.hypot(cleaned[i][0] - cleaned[i - 1][0], cleaned[i][1] - cleaned[i - 1][1])
-                            for i in range(1, len(cleaned))
-                        )
-                        if seg_len > 1e-2:
-                            segments.append((cleaned, seg_len))
-                except Exception:
+                if ax1 < bx0 - 1.0 or bx1 < ax0 - 1.0 or ay1 < by0 - 1.0 or by1 < ay0 - 1.0:
                     continue
 
-        seg_polys = [item[0] for item in segments]
-        grid_cells = self._extract_grid_cell_polygons(seg_polys, cluster_tol=max(tolerance * 3.0, 15.0))
+                inter = self._segment_intersection_2d(a1, a2, b1, b2)
+                if inter is not None:
+                    split_pts_per_seg[i].append(inter)
+                    split_pts_per_seg[j].append(inter)
 
-        # Sort shortest segments first to close small individual/curved/angled pieces first
-        segments.sort(key=lambda item: item[1])
-        sorted_segs = [item[0] for item in segments]
+        atomic_edges = []
+        for idx, pts_list in enumerate(split_pts_per_seg):
+            p_start, p_end = sub_segs[idx][0], sub_segs[idx][1]
+            dx, dy = p_end[0] - p_start[0], p_end[1] - p_start[1]
+            ordered = sorted(pts_list, key=lambda p: (p[0] - p_start[0]) * dx + (p[1] - p_start[1]) * dy)
+            cleaned = self._clean_polygon_points(ordered, eps=max(self.snap_tolerance * 0.25, 0.25))
+            for k in range(len(cleaned) - 1):
+                if math.hypot(cleaned[k + 1][0] - cleaned[k][0], cleaned[k + 1][1] - cleaned[k][1]) > 0.5:
+                    atomic_edges.append((cleaned[k], cleaned[k + 1]))
 
-        def dist(p1, p2):
-            return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+        return atomic_edges
 
-        closed_loops = list(grid_cells)
-        used_segments = set()
+    def _extract_minimal_faces_from_intersections(self, polylines: list) -> list:
+        """
+        Build a planar-style graph from split crossing segments and extract small
+        closed tile faces by turning toward the sharpest angle at each junction.
+        """
+        edges = self._split_intersecting_polylines(polylines)
+        if not edges:
+            return []
 
-        for start_idx in range(len(sorted_segs)):
-            if start_idx in used_segments:
+        # Snap vertices within tolerance
+        nodes = []
+        node_map = {}
+
+        def get_node(pt: tuple) -> int:
+            for idx, npt in enumerate(nodes):
+                if math.hypot(pt[0] - npt[0], pt[1] - npt[1]) <= self.snap_tolerance:
+                    return idx
+            idx = len(nodes)
+            nodes.append((round(pt[0], 3), round(pt[1], 3)))
+            node_map[idx] = nodes[-1]
+            return idx
+
+        # Directed half-edges: (u, v, angle_from_u_to_v)
+        adj = {}
+        half_edges = []
+        for p1, p2 in edges:
+            u = get_node(p1)
+            v = get_node(p2)
+            if u == v:
+                continue
+            ang_uv = math.atan2(nodes[v][1] - nodes[u][1], nodes[v][0] - nodes[u][0])
+            ang_vu = math.atan2(nodes[u][1] - nodes[v][1], nodes[u][0] - nodes[v][0])
+            he_id_1 = len(half_edges)
+            half_edges.append((u, v, ang_uv))
+            adj.setdefault(u, []).append((ang_uv, v, he_id_1))
+
+            he_id_2 = len(half_edges)
+            half_edges.append((v, u, ang_vu))
+            adj.setdefault(v, []).append((ang_vu, u, he_id_2))
+
+        for u in adj:
+            adj[u].sort(key=lambda item: item[0])
+
+        visited_half_edges = set()
+        candidate_faces = []
+
+        for start_he in range(len(half_edges)):
+            if start_he in visited_half_edges:
                 continue
 
-            chain = list(sorted_segs[start_idx])
-            chain_used = {start_idx}
-            closed_here = False
+            cur_he = start_he
+            u0, v0, ang_prev = half_edges[cur_he]
+            face_nodes = [u0, v0]
+            used_in_face = {cur_he}
+            closed = False
 
-            for _ in range(len(sorted_segs)):
-                if len(chain) >= 3 and dist(chain[-1], chain[0]) <= tolerance:
-                    closed_here = True
+            for _ in range(self.max_chain_steps):
+                _, cur_v, cur_ang = half_edges[cur_he]
+                if cur_v == u0 and len(face_nodes) >= 3:
+                    closed = True
                     break
 
-                best_match = None
-                best_dist = tolerance + 1e-6
+                outgoing = adj.get(cur_v, [])
+                if not outgoing:
+                    break
 
-                for cand_idx, seg in enumerate(sorted_segs):
-                    if cand_idx in chain_used:
+                # Reverse direction is cur_ang + pi; pick next sharpest right/left turn
+                rev_ang = (cur_ang + math.pi + 2 * math.pi) % (2 * math.pi)
+                best_next = None
+                best_turn = float("inf")
+
+                for ang_out, nxt_node, nxt_he_id in outgoing:
+                    if nxt_node == face_nodes[-2] and len(outgoing) > 1:
                         continue
+                    diff = (rev_ang - ang_out) % (2 * math.pi)
+                    if diff < 1e-4:
+                        diff = 2 * math.pi
+                    if diff < best_turn:
+                        best_turn = diff
+                        best_next = (nxt_node, nxt_he_id)
 
-                    d_tail_start = dist(chain[-1], seg[0])
-                    if d_tail_start <= best_dist:
-                        best_dist = d_tail_start
-                        best_match = ("tail", cand_idx, seg[1:])
-
-                    d_tail_end = dist(chain[-1], seg[-1])
-                    if d_tail_end <= best_dist:
-                        best_dist = d_tail_end
-                        best_match = ("tail", cand_idx, list(reversed(seg[:-1])))
-
-                    d_head_end = dist(chain[0], seg[-1])
-                    if d_head_end <= best_dist:
-                        best_dist = d_head_end
-                        best_match = ("head", cand_idx, seg[:-1])
-
-                    d_head_start = dist(chain[0], seg[0])
-                    if d_head_start <= best_dist:
-                        best_dist = d_head_start
-                        best_match = ("head", cand_idx, list(reversed(seg[1:])))
-
-                if best_match is None:
+                if best_next is None:
                     break
 
-                side, cand_idx, piece_pts = best_match
-                if side == "tail":
-                    chain.extend(piece_pts)
-                else:
-                    chain = piece_pts + chain
-
-                chain_used.add(cand_idx)
-
-                if len(chain) >= 3 and dist(chain[-1], chain[0]) <= tolerance:
-                    closed_here = True
+                nxt_node, nxt_he_id = best_next
+                if nxt_he_id in used_in_face and nxt_node != u0:
                     break
 
-            if closed_here:
-                cleaned = self._clean_polygon_points(chain, eps=1e-3)
-                if len(cleaned) >= 3 and self._polygon_area(cleaned) >= self.min_piece_area_mm2:
-                    closed_loops.append(cleaned)
-                    used_segments.update(chain_used)
+                cur_he = nxt_he_id
+                used_in_face.add(cur_he)
+                face_nodes.append(nxt_node)
 
-        return closed_loops
+                if nxt_node == u0 and len(face_nodes) >= 3:
+                    closed = True
+                    break
+
+            if closed:
+                poly_pts = self._clean_polygon_points([nodes[nid] for nid in face_nodes[:-1]], eps=0.25)
+                area = self._polygon_area(poly_pts)
+                if len(poly_pts) >= 3 and area >= self.min_piece_area_mm2:
+                    candidate_faces.append((area, poly_pts, used_in_face))
+
+        # Sort smallest faces first so individual small tiles are kept before large loops
+        candidate_faces.sort(key=lambda item: item[0])
+        accepted_faces = []
+        consumed_hes = set()
+
+        for area, poly_pts, he_set in candidate_faces:
+            overlap = len(he_set.intersection(consumed_hes))
+            if overlap <= max(1, len(he_set) // 3):
+                accepted_faces.append(poly_pts)
+                consumed_hes.update(he_set)
+
+        return accepted_faces
 
     def _deduplicate_polygons(self, records: list, pos_tol: float = 5.0, area_tol: float = 0.05) -> list:
         """Remove near-duplicate closed polygons representing the same tile."""
@@ -437,8 +428,8 @@ class UnifiedFabricationEngine:
 
     def _filter_outer_frame_if_needed(self, records: list) -> list:
         """
-        Remove any outer boundary polygon that encloses multiple smaller tile panels
-        or is disproportionately larger than individual tiles.
+        Remove the overall tiles-area outline boundary when smaller individual tiles are
+        detected.
         """
         if len(records) < 2:
             return records
@@ -453,25 +444,32 @@ class UnifiedFabricationEngine:
             entries.append((rec, bbox, area))
 
         areas_sorted = sorted(e[2] for e in entries if e[2] > 0)
-        median_area = areas_sorted[len(areas_sorted) // 2] if areas_sorted else 0.0
+        if len(areas_sorted) < 2:
+            return records
+
+        q25_idx = max(0, (len(areas_sorted) - 1) // 4)
+        baseline_small_area = areas_sorted[q25_idx]
 
         filtered = []
         for rec, box, area in entries:
             enclosed_others = 0
-            for other_rec, other_box, other_area in entries:
-                if other_rec is rec or other_area >= area * 0.95:
+            for other_rec, _, other_area in entries:
+                if other_rec is rec or other_area >= area * 0.90:
                     continue
                 ocx, ocy = self._polygon_centroid(other_rec["points"])
                 if (
-                    ocx >= box[0] + 1.0
-                    and ocx <= box[2] - 1.0
-                    and ocy >= box[1] + 1.0
-                    and ocy <= box[3] - 1.0
+                    ocx >= box[0] - 1.0
+                    and ocx <= box[2] + 1.0
+                    and ocy >= box[1] - 1.0
+                    and ocy <= box[3] + 1.0
                 ):
                     enclosed_others += 1
 
-            is_outer_wrapper = enclosed_others >= 1 and area > median_area * 1.8
-            if not is_outer_wrapper:
+            is_oversized_outline = (
+                (enclosed_others >= 1 and area > baseline_small_area * self.outer_area_ratio_threshold)
+                or (area > baseline_small_area * (self.outer_area_ratio_threshold * 1.5))
+            )
+            if not is_oversized_outline:
                 filtered.append(rec)
 
         return filtered if filtered else records
@@ -515,17 +513,16 @@ class UnifiedFabricationEngine:
 
     def process_geometry(self) -> list:
         """
-        Extract individual closed tile/panel boundaries on the target layer,
-        classify special detail sheets vs. perimeter COS panels vs. standard panels,
-        assign 3-digit tags (001, 002, ...) without circles, and apply kerf + COS allowances.
+        Extract individual closed tile/panel boundaries formed by closed polylines,
+        curves, and intersecting/crossing lines/arcs on the target layer.
         """
         if self.msp is None:
             self.load_dxf()
 
         kerf = float(self.profile["default_kerf_mm"])
         raw_records = []
+        open_or_line_polylines = []
 
-        # 1. Closed / near-closed LWPOLYLINE & POLYLINE entities
         for entity in self._collect_geometry_entities():
             etype = entity.dxftype()
             has_bulge = False
@@ -558,10 +555,10 @@ class UnifiedFabricationEngine:
                         "vertex_count": len(cleaned_pts),
                         "has_arcs": has_bulge
                     })
+                elif len(cleaned_pts) >= 2:
+                    open_or_line_polylines.append(cleaned_pts)
 
-        # 2. Closed CIRCLE / ELLIPSE panels
-        for entity in self._collect_geometry_entities():
-            if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
+            elif etype in ("CIRCLE", "ELLIPSE"):
                 try:
                     p = make_path(entity)
                     pts = [(v.x, v.y) for v in p.flattening(distance=0.5)]
@@ -576,11 +573,21 @@ class UnifiedFabricationEngine:
                 except Exception:
                     continue
 
-        # 3. Individual closed tile cells & loops from separate LINE / ARC / SPLINE segments
-        closed_loops = self._extract_closed_loops_from_lines_and_arcs(tolerance=self.snap_tolerance)
-        for poly in closed_loops:
+            elif etype in ("LINE", "ARC", "SPLINE"):
+                try:
+                    p = make_path(entity)
+                    pts = [(round(v.x, 3), round(v.y, 3)) for v in p.flattening(distance=0.5)]
+                    cleaned = self._clean_polygon_points(pts, eps=1e-3)
+                    if len(cleaned) >= 2:
+                        open_or_line_polylines.append(cleaned)
+                except Exception:
+                    continue
+
+        # Extract minimal closed faces from intersecting/crossing lines and curves
+        intersecting_faces = self._extract_minimal_faces_from_intersections(open_or_line_polylines)
+        for poly in intersecting_faces:
             raw_records.append({
-                "source": "Closed Line/Arc Panel",
+                "source": "Intersecting Line/Curve Tile",
                 "points": poly,
                 "vertex_count": len(poly),
                 "has_arcs": len(poly) >= 12
