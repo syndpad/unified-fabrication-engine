@@ -10,8 +10,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 class UnifiedFabricationEngine:
     """
     Unified Multi-Material Fabrication Core for Architectural Contracting.
-    Splits intersecting/crossing lines and curves in 2D to extract individual
-    closed tile/panel boundaries on the target layer, avoiding outer borders.
+    Extracts individual closed tile/panel boundaries on the target layer from
+    polylines, curves, and intersecting/crossing lines or arcs while avoiding
+    outer outline borders and guarding against dense-drawing stalls.
     """
 
     DEFAULT_PROFILES = {
@@ -247,45 +248,58 @@ class UnifiedFabricationEngine:
             return (round(ix, 3), round(iy, 3))
         return None
 
-    def _split_intersecting_polylines(self, polylines: list) -> list:
+    def _split_intersecting_polylines(self, polylines: list, max_split_segments: int = 400) -> list:
         """
-        Split polylines/segments at all 2D intersection points with other segments
-        so crossing lines and curves break cleanly at tile boundaries.
+        Split polylines/segments at 2D intersection points with bounding-box pruning
+        and a segment cap so dense DXF drawings never stall execution.
         """
         sub_segs = []
         for poly in polylines:
+            if not poly or len(poly) < 2:
+                continue
             for i in range(len(poly) - 1):
                 p1, p2 = poly[i], poly[i + 1]
                 if math.hypot(p2[0] - p1[0], p2[1] - p1[1]) > 1e-2:
-                    sub_segs.append([p1, p2])
+                    sub_segs.append((p1, p2))
+
+        if not sub_segs:
+            return []
+
+        if len(sub_segs) > max_split_segments:
+            return sub_segs
 
         n_segs = len(sub_segs)
         split_pts_per_seg = [[s[0], s[1]] for s in sub_segs]
+        bboxes = [
+            (
+                min(s[0][0], s[1][0]),
+                min(s[0][1], s[1][1]),
+                max(s[0][0], s[1][0]),
+                max(s[0][1], s[1][1]),
+            )
+            for s in sub_segs
+        ]
 
         for i in range(n_segs):
-            a1, a2 = sub_segs[i][0], sub_segs[i][1]
-            ax0, ax1 = min(a1[0], a2[0]), max(a1[0], a2[0])
-            ay0, ay1 = min(a1[1], a2[1]), max(a1[1], a2[1])
-
+            a1, a2 = sub_segs[i]
+            ax0, ay0, ax1, ay1 = bboxes[i]
             for j in range(i + 1, n_segs):
-                b1, b2 = sub_segs[j][0], sub_segs[j][1]
-                bx0, bx1 = min(b1[0], b2[0]), max(b1[0], b2[0])
-                by0, by1 = min(b1[1], b2[1]), max(b1[1], b2[1])
-
+                bx0, by0, bx1, by1 = bboxes[j]
                 if ax1 < bx0 - 1.0 or bx1 < ax0 - 1.0 or ay1 < by0 - 1.0 or by1 < ay0 - 1.0:
                     continue
-
+                b1, b2 = sub_segs[j]
                 inter = self._segment_intersection_2d(a1, a2, b1, b2)
                 if inter is not None:
                     split_pts_per_seg[i].append(inter)
                     split_pts_per_seg[j].append(inter)
 
         atomic_edges = []
+        eps_clean = max(self.snap_tolerance * 0.25, 0.25)
         for idx, pts_list in enumerate(split_pts_per_seg):
-            p_start, p_end = sub_segs[idx][0], sub_segs[idx][1]
+            p_start, p_end = sub_segs[idx]
             dx, dy = p_end[0] - p_start[0], p_end[1] - p_start[1]
             ordered = sorted(pts_list, key=lambda p: (p[0] - p_start[0]) * dx + (p[1] - p_start[1]) * dy)
-            cleaned = self._clean_polygon_points(ordered, eps=max(self.snap_tolerance * 0.25, 0.25))
+            cleaned = self._clean_polygon_points(ordered, eps=eps_clean)
             for k in range(len(cleaned) - 1):
                 if math.hypot(cleaned[k + 1][0] - cleaned[k][0], cleaned[k + 1][1] - cleaned[k][1]) > 0.5:
                     atomic_edges.append((cleaned[k], cleaned[k + 1]))
@@ -295,117 +309,112 @@ class UnifiedFabricationEngine:
     def _extract_minimal_faces_from_intersections(self, polylines: list) -> list:
         """
         Build a planar-style graph from split crossing segments and extract small
-        closed tile faces by turning toward the sharpest angle at each junction.
+        closed tile faces safely.
         """
-        edges = self._split_intersecting_polylines(polylines)
-        if not edges:
+        try:
+            edges = self._split_intersecting_polylines(polylines)
+            if not edges:
+                return []
+
+            nodes = []
+
+            def get_node(pt: tuple) -> int:
+                for idx, npt in enumerate(nodes):
+                    if math.hypot(pt[0] - npt[0], pt[1] - npt[1]) <= self.snap_tolerance:
+                        return idx
+                idx = len(nodes)
+                nodes.append((round(pt[0], 3), round(pt[1], 3)))
+                return idx
+
+            adj = {}
+            half_edges = []
+            for p1, p2 in edges:
+                u = get_node(p1)
+                v = get_node(p2)
+                if u == v:
+                    continue
+                ang_uv = math.atan2(nodes[v][1] - nodes[u][1], nodes[v][0] - nodes[u][0])
+                ang_vu = math.atan2(nodes[u][1] - nodes[v][1], nodes[u][0] - nodes[v][0])
+                he_1 = len(half_edges)
+                half_edges.append((u, v, ang_uv))
+                adj.setdefault(u, []).append((ang_uv, v, he_1))
+
+                he_2 = len(half_edges)
+                half_edges.append((v, u, ang_vu))
+                adj.setdefault(v, []).append((ang_vu, u, he_2))
+
+            for u in adj:
+                adj[u].sort(key=lambda item: item[0])
+
+            candidate_faces = []
+            max_starts = min(len(half_edges), 2000)
+
+            for start_he in range(max_starts):
+                cur_he = start_he
+                u0, v0, _ = half_edges[cur_he]
+                face_nodes = [u0, v0]
+                used_in_face = {cur_he}
+                closed = False
+
+                for _ in range(self.max_chain_steps):
+                    _, cur_v, cur_ang = half_edges[cur_he]
+                    if cur_v == u0 and len(face_nodes) >= 3:
+                        closed = True
+                        break
+
+                    outgoing = adj.get(cur_v, [])
+                    if not outgoing:
+                        break
+
+                    rev_ang = (cur_ang + math.pi + 2 * math.pi) % (2 * math.pi)
+                    best_next = None
+                    best_turn = float("inf")
+                    prev_node = face_nodes[-2] if len(face_nodes) >= 2 else None
+
+                    for _, nxt_node, nxt_he_id in outgoing:
+                        if prev_node is not None and nxt_node == prev_node and len(outgoing) > 1:
+                            continue
+                        diff = (rev_ang - half_edges[nxt_he_id][2]) % (2 * math.pi)
+                        if diff < 1e-4:
+                            diff = 2 * math.pi
+                        if diff < best_turn:
+                            best_turn = diff
+                            best_next = (nxt_node, nxt_he_id)
+
+                    if best_next is None:
+                        break
+
+                    nxt_node, nxt_he_id = best_next
+                    if nxt_he_id in used_in_face and nxt_node != u0:
+                        break
+
+                    cur_he = nxt_he_id
+                    used_in_face.add(cur_he)
+                    face_nodes.append(nxt_node)
+
+                    if nxt_node == u0 and len(face_nodes) >= 3:
+                        closed = True
+                        break
+
+                if closed:
+                    poly_pts = self._clean_polygon_points([nodes[nid] for nid in face_nodes[:-1]], eps=0.25)
+                    area = self._polygon_area(poly_pts)
+                    if len(poly_pts) >= 3 and area >= self.min_piece_area_mm2:
+                        candidate_faces.append((area, poly_pts, used_in_face))
+
+            candidate_faces.sort(key=lambda item: item[0])
+            accepted_faces = []
+            consumed_hes = set()
+
+            for _, poly_pts, he_set in candidate_faces:
+                overlap = len(he_set.intersection(consumed_hes))
+                if overlap <= max(1, len(he_set) // 3):
+                    accepted_faces.append(poly_pts)
+                    consumed_hes.update(he_set)
+
+            return accepted_faces
+        except Exception:
             return []
-
-        # Snap vertices within tolerance
-        nodes = []
-        node_map = {}
-
-        def get_node(pt: tuple) -> int:
-            for idx, npt in enumerate(nodes):
-                if math.hypot(pt[0] - npt[0], pt[1] - npt[1]) <= self.snap_tolerance:
-                    return idx
-            idx = len(nodes)
-            nodes.append((round(pt[0], 3), round(pt[1], 3)))
-            node_map[idx] = nodes[-1]
-            return idx
-
-        # Directed half-edges: (u, v, angle_from_u_to_v)
-        adj = {}
-        half_edges = []
-        for p1, p2 in edges:
-            u = get_node(p1)
-            v = get_node(p2)
-            if u == v:
-                continue
-            ang_uv = math.atan2(nodes[v][1] - nodes[u][1], nodes[v][0] - nodes[u][0])
-            ang_vu = math.atan2(nodes[u][1] - nodes[v][1], nodes[u][0] - nodes[v][0])
-            he_id_1 = len(half_edges)
-            half_edges.append((u, v, ang_uv))
-            adj.setdefault(u, []).append((ang_uv, v, he_id_1))
-
-            he_id_2 = len(half_edges)
-            half_edges.append((v, u, ang_vu))
-            adj.setdefault(v, []).append((ang_vu, u, he_id_2))
-
-        for u in adj:
-            adj[u].sort(key=lambda item: item[0])
-
-        visited_half_edges = set()
-        candidate_faces = []
-
-        for start_he in range(len(half_edges)):
-            if start_he in visited_half_edges:
-                continue
-
-            cur_he = start_he
-            u0, v0, ang_prev = half_edges[cur_he]
-            face_nodes = [u0, v0]
-            used_in_face = {cur_he}
-            closed = False
-
-            for _ in range(self.max_chain_steps):
-                _, cur_v, cur_ang = half_edges[cur_he]
-                if cur_v == u0 and len(face_nodes) >= 3:
-                    closed = True
-                    break
-
-                outgoing = adj.get(cur_v, [])
-                if not outgoing:
-                    break
-
-                # Reverse direction is cur_ang + pi; pick next sharpest right/left turn
-                rev_ang = (cur_ang + math.pi + 2 * math.pi) % (2 * math.pi)
-                best_next = None
-                best_turn = float("inf")
-
-                for ang_out, nxt_node, nxt_he_id in outgoing:
-                    if nxt_node == face_nodes[-2] and len(outgoing) > 1:
-                        continue
-                    diff = (rev_ang - ang_out) % (2 * math.pi)
-                    if diff < 1e-4:
-                        diff = 2 * math.pi
-                    if diff < best_turn:
-                        best_turn = diff
-                        best_next = (nxt_node, nxt_he_id)
-
-                if best_next is None:
-                    break
-
-                nxt_node, nxt_he_id = best_next
-                if nxt_he_id in used_in_face and nxt_node != u0:
-                    break
-
-                cur_he = nxt_he_id
-                used_in_face.add(cur_he)
-                face_nodes.append(nxt_node)
-
-                if nxt_node == u0 and len(face_nodes) >= 3:
-                    closed = True
-                    break
-
-            if closed:
-                poly_pts = self._clean_polygon_points([nodes[nid] for nid in face_nodes[:-1]], eps=0.25)
-                area = self._polygon_area(poly_pts)
-                if len(poly_pts) >= 3 and area >= self.min_piece_area_mm2:
-                    candidate_faces.append((area, poly_pts, used_in_face))
-
-        # Sort smallest faces first so individual small tiles are kept before large loops
-        candidate_faces.sort(key=lambda item: item[0])
-        accepted_faces = []
-        consumed_hes = set()
-
-        for area, poly_pts, he_set in candidate_faces:
-            overlap = len(he_set.intersection(consumed_hes))
-            if overlap <= max(1, len(he_set) // 3):
-                accepted_faces.append(poly_pts)
-                consumed_hes.update(he_set)
-
-        return accepted_faces
 
     def _deduplicate_polygons(self, records: list, pos_tol: float = 5.0, area_tol: float = 0.05) -> list:
         """Remove near-duplicate closed polygons representing the same tile."""
@@ -514,7 +523,7 @@ class UnifiedFabricationEngine:
     def process_geometry(self) -> list:
         """
         Extract individual closed tile/panel boundaries formed by closed polylines,
-        curves, and intersecting/crossing lines/arcs on the target layer.
+        curves, and intersecting/crossing lines or arcs on the target layer.
         """
         if self.msp is None:
             self.load_dxf()
@@ -583,7 +592,6 @@ class UnifiedFabricationEngine:
                 except Exception:
                     continue
 
-        # Extract minimal closed faces from intersecting/crossing lines and curves
         intersecting_faces = self._extract_minimal_faces_from_intersections(open_or_line_polylines)
         for poly in intersecting_faces:
             raw_records.append({
