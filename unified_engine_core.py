@@ -10,9 +10,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 class UnifiedFabricationEngine:
     """
     Unified Multi-Material Fabrication Core for Architectural Contracting.
-    Incorporates v12.0 MARBLE_AUTOLIST options: target layer & hatch material mapping,
-    grid seed sampling & outer wrapper filtering, COS margin & detail-sheet classification,
-    minimum-wastage ABB rotation, 4-sided dimensions, and Excel/DXF deliverables.
+    Extracts individual closed tile/panel boundaries on the target layer rather than
+    the overall tiles-area outline border, with ABB rotation, COS margins,
+    3-digit tags (no circles), and Excel/DXF deliverables.
     """
 
     DEFAULT_PROFILES = {
@@ -130,18 +130,6 @@ class UnifiedFabricationEngine:
                 layers.add(l_name)
         return sorted(layers)
 
-    def inspect_hatch_keys(self) -> list:
-        """Return unique (PATTERN_NAME, COLOR_INDEX) keys found on target/modelspace hatches."""
-        if self.msp is None:
-            self.load_dxf()
-        keys = set()
-        for entity in self._collect_geometry_entities():
-            if entity.dxftype() == "HATCH":
-                pat = (getattr(entity.dxf, "pattern_name", "") or "SOLID").upper()
-                col = int(getattr(entity.dxf, "color", 256) or 256)
-                keys.add((pat, col))
-        return sorted(keys)
-
     def _layer_matches(self, entity) -> bool:
         """Return True if no target layer is set or entity layer matches target_layer."""
         if not self.target_layer:
@@ -221,7 +209,7 @@ class UnifiedFabricationEngine:
 
     @staticmethod
     def _cluster_coords(values: list, tol: float = 15.0) -> list:
-        """Cluster sorted coordinate values within tolerance (v12 seed grid helper)."""
+        """Cluster sorted coordinate values within tolerance."""
         if not values:
             return []
         clustered = [float(values[0])]
@@ -231,46 +219,10 @@ class UnifiedFabricationEngine:
                 clustered.append(val_f)
         return clustered
 
-    def _build_grid_seed_points(self, segments: list, cluster_tol: float = 15.0) -> list:
-        """Build interior cell seed points from X/Y coordinate grid and angled line offsets."""
-        raw_xs = []
-        raw_ys = []
-        diag_probes = []
-
-        for seg in segments:
-            for pt in seg:
-                raw_xs.append(pt[0])
-                raw_ys.append(pt[1])
-            if len(seg) >= 2:
-                p1, p2 = seg[0], seg[-1]
-                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
-                seg_len = math.hypot(dx, dy)
-                if seg_len > 20.0 and abs(dx) > 5.0 and abs(dy) > 5.0:
-                    mx, my = (p1[0] + p2[0]) * 0.5, (p1[1] + p2[1]) * 0.5
-                    nx, ny = -dy / seg_len, dx / seg_len
-                    diag_probes.append((round(mx + nx * 45.0, 3), round(my + ny * 45.0, 3)))
-                    diag_probes.append((round(mx - nx * 45.0, 3), round(my - ny * 45.0, 3)))
-
-        ux = self._cluster_coords(sorted(raw_xs), tol=cluster_tol)
-        uy = self._cluster_coords(sorted(raw_ys), tol=cluster_tol)
-
-        probes = list(diag_probes)
-        for i in range(len(ux) - 1):
-            x_a, x_b = ux[i], ux[i + 1]
-            if (x_b - x_a) > 25.0:
-                cx = (x_a + x_b) * 0.5
-                for j in range(len(uy) - 1):
-                    y_a, y_b = uy[j], uy[j + 1]
-                    if (y_b - y_a) > 25.0:
-                        cy = (y_a + y_b) * 0.5
-                        probes.append((round(cx, 3), round(cy, 3)))
-
-        return probes
-
     def _get_min_wastage_bbox_and_angle(self, points: list) -> tuple:
         """
         Calculate minimum-area bounding box (length, width) and optimal rotation angle
-        across candidate orientations (v11/v12 ABB rotation logic).
+        across candidate orientations.
         """
         pts = self._clean_polygon_points(points)
         if len(pts) < 3:
@@ -304,10 +256,72 @@ class UnifiedFabricationEngine:
 
         return round(best_w, 2), round(best_h, 2), best_angle
 
+    def _extract_grid_cell_polygons(self, segments: list, cluster_tol: float = 15.0) -> list:
+        """
+        Detect individual rectangular/grid tile cells formed by horizontal and vertical
+        lines/segments when lines share grid coordinates across a tiled layout.
+        """
+        h_lines = []
+        v_lines = []
+        for seg in segments:
+            if len(seg) < 2:
+                continue
+            p1, p2 = seg[0], seg[-1]
+            dx = abs(p2[0] - p1[0])
+            dy = abs(p2[1] - p1[1])
+            if dy <= cluster_tol and dx > cluster_tol:
+                y_val = (p1[1] + p2[1]) * 0.5
+                h_lines.append((y_val, min(p1[0], p2[0]), max(p1[0], p2[0])))
+            elif dx <= cluster_tol and dy > cluster_tol:
+                x_val = (p1[0] + p2[0]) * 0.5
+                v_lines.append((x_val, min(p1[1], p2[1]), max(p1[1], p2[1])))
+
+        if len(h_lines) < 2 or len(v_lines) < 2:
+            return []
+
+        xs = self._cluster_coords(sorted([v[0] for v in v_lines]), tol=cluster_tol)
+        ys = self._cluster_coords(sorted([h[0] for h in h_lines]), tol=cluster_tol)
+
+        if len(xs) < 2 or len(ys) < 2:
+            return []
+
+        def has_h_span(y_coord, x_start, x_end):
+            for hy, hx0, hx1 in h_lines:
+                if abs(hy - y_coord) <= cluster_tol and hx0 <= x_start + cluster_tol and hx1 >= x_end - cluster_tol:
+                    return True
+            return False
+
+        def has_v_span(x_coord, y_start, y_end):
+            for vx, vy0, vy1 in v_lines:
+                if abs(vx - x_coord) <= cluster_tol and vy0 <= y_start + cluster_tol and vy1 >= y_end - cluster_tol:
+                    return True
+            return False
+
+        cell_polys = []
+        for i in range(len(xs) - 1):
+            x0, x1 = xs[i], xs[i + 1]
+            if (x1 - x0) < 20.0:
+                continue
+            for j in range(len(ys) - 1):
+                y0, y1 = ys[j], ys[j + 1]
+                if (y1 - y0) < 20.0:
+                    continue
+                if (
+                    has_h_span(y0, x0, x1)
+                    and has_h_span(y1, x0, x1)
+                    and has_v_span(x0, y0, y1)
+                    and has_v_span(x1, y0, y1)
+                ):
+                    area = (x1 - x0) * (y1 - y0)
+                    if area >= self.min_piece_area_mm2:
+                        cell_polys.append([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+        return cell_polys
+
     def _extract_closed_loops_from_lines_and_arcs(self, tolerance: float = 2.0) -> list:
         """
-        Extract individual closed loops from separate LINE, ARC, and SPLINE segments
-        on the selected layer, prioritizing smaller closed panels over large outer envelopes.
+        Extract individual closed tile/panel boundaries from separate LINE, ARC,
+        and SPLINE segments on the selected layer without collapsing into the outer border.
         """
         segments = []
         for entity in self._collect_geometry_entities():
@@ -326,26 +340,28 @@ class UnifiedFabricationEngine:
                 except Exception:
                     continue
 
-        self.seed_probe_points = self._build_grid_seed_points([s[0] for s in segments])
-
-        segments.sort(key=lambda item: item[1])
         seg_polys = [item[0] for item in segments]
+        grid_cells = self._extract_grid_cell_polygons(seg_polys, cluster_tol=max(tolerance * 3.0, 15.0))
+
+        # Sort shortest segments first to close small individual/curved/angled pieces first
+        segments.sort(key=lambda item: item[1])
+        sorted_segs = [item[0] for item in segments]
 
         def dist(p1, p2):
             return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-        closed_loops = []
+        closed_loops = list(grid_cells)
         used_segments = set()
 
-        for start_idx in range(len(seg_polys)):
+        for start_idx in range(len(sorted_segs)):
             if start_idx in used_segments:
                 continue
 
-            chain = list(seg_polys[start_idx])
+            chain = list(sorted_segs[start_idx])
             chain_used = {start_idx}
             closed_here = False
 
-            for _ in range(len(seg_polys)):
+            for _ in range(len(sorted_segs)):
                 if len(chain) >= 3 and dist(chain[-1], chain[0]) <= tolerance:
                     closed_here = True
                     break
@@ -353,7 +369,7 @@ class UnifiedFabricationEngine:
                 best_match = None
                 best_dist = tolerance + 1e-6
 
-                for cand_idx, seg in enumerate(seg_polys):
+                for cand_idx, seg in enumerate(sorted_segs):
                     if cand_idx in chain_used:
                         continue
 
@@ -400,24 +416,18 @@ class UnifiedFabricationEngine:
 
         return closed_loops
 
-    def _deduplicate_polygons(self, records: list, pos_tol: float = 2.0, area_tol: float = 0.03) -> list:
-        """Remove near-duplicate closed polygons representing the same panel."""
+    def _deduplicate_polygons(self, records: list, pos_tol: float = 5.0, area_tol: float = 0.05) -> list:
+        """Remove near-duplicate closed polygons representing the same tile."""
         unique = []
         for rec in records:
             pts = rec["points"]
             area = abs(self._polygon_area(pts))
-            cx, cy = (
-                sum(p[0] for p in pts) / len(pts),
-                sum(p[1] for p in pts) / len(pts)
-            )
+            cx, cy = self._polygon_centroid(pts)
             is_dup = False
             for existing in unique:
                 e_pts = existing["points"]
                 e_area = abs(self._polygon_area(e_pts))
-                e_cx, e_cy = (
-                    sum(p[0] for p in e_pts) / len(e_pts),
-                    sum(p[1] for p in e_pts) / len(e_pts)
-                )
+                e_cx, e_cy = self._polygon_centroid(e_pts)
                 if math.hypot(cx - e_cx, cy - e_cy) <= pos_tol and abs(area - e_area) / max(area, e_area, 1e-6) <= area_tol:
                     is_dup = True
                     break
@@ -425,10 +435,12 @@ class UnifiedFabricationEngine:
                 unique.append(rec)
         return unique
 
-    @staticmethod
-    def _filter_outer_frame_if_needed(records: list) -> list:
-        """Remove a single enclosing outer border if it wraps multiple smaller panels."""
-        if len(records) < 3:
+    def _filter_outer_frame_if_needed(self, records: list) -> list:
+        """
+        Remove any outer boundary polygon that encloses multiple smaller tile panels
+        or is disproportionately larger than individual tiles.
+        """
+        if len(records) < 2:
             return records
 
         entries = []
@@ -437,29 +449,32 @@ class UnifiedFabricationEngine:
             xs = [p[0] for p in pts]
             ys = [p[1] for p in pts]
             bbox = (min(xs), min(ys), max(xs), max(ys))
-            bbox_area = max((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]), 0.0)
-            entries.append((rec, bbox, bbox_area))
+            area = abs(self._polygon_area(pts))
+            entries.append((rec, bbox, area))
 
-        max_entry = max(entries, key=lambda x: x[2])
-        _, max_box, max_area = max_entry
+        areas_sorted = sorted(e[2] for e in entries if e[2] > 0)
+        median_area = areas_sorted[len(areas_sorted) // 2] if areas_sorted else 0.0
 
-        enclosed_count = 0
-        for item in entries:
-            if item is max_entry:
-                continue
-            _, b, _ = item
-            if (
-                b[0] >= max_box[0] - 1.0
-                and b[1] >= max_box[1] - 1.0
-                and b[2] <= max_box[2] + 1.0
-                and b[3] <= max_box[3] + 1.0
-            ):
-                enclosed_count += 1
+        filtered = []
+        for rec, box, area in entries:
+            enclosed_others = 0
+            for other_rec, other_box, other_area in entries:
+                if other_rec is rec or other_area >= area * 0.95:
+                    continue
+                ocx, ocy = self._polygon_centroid(other_rec["points"])
+                if (
+                    ocx >= box[0] + 1.0
+                    and ocx <= box[2] - 1.0
+                    and ocy >= box[1] + 1.0
+                    and ocy <= box[3] - 1.0
+                ):
+                    enclosed_others += 1
 
-        if enclosed_count >= 2 and max_area > 0:
-            return [rec for rec, _, _ in entries if rec is not max_entry[0]]
+            is_outer_wrapper = enclosed_others >= 1 and area > median_area * 1.8
+            if not is_outer_wrapper:
+                filtered.append(rec)
 
-        return records
+        return filtered if filtered else records
 
     @staticmethod
     def _sort_records_by_grid(records: list, row_band: float = 150.0) -> list:
@@ -500,9 +515,9 @@ class UnifiedFabricationEngine:
 
     def process_geometry(self) -> list:
         """
-        Extract closed panels on the target layer, classify special detail sheets vs.
-        perimeter COS panels vs. standard panels, assign 3-digit tags (001, 002, ...),
-        and apply kerf + COS allowances.
+        Extract individual closed tile/panel boundaries on the target layer,
+        classify special detail sheets vs. perimeter COS panels vs. standard panels,
+        assign 3-digit tags (001, 002, ...) without circles, and apply kerf + COS allowances.
         """
         if self.msp is None:
             self.load_dxf()
@@ -510,6 +525,7 @@ class UnifiedFabricationEngine:
         kerf = float(self.profile["default_kerf_mm"])
         raw_records = []
 
+        # 1. Closed / near-closed LWPOLYLINE & POLYLINE entities
         for entity in self._collect_geometry_entities():
             etype = entity.dxftype()
             has_bulge = False
@@ -543,6 +559,7 @@ class UnifiedFabricationEngine:
                         "has_arcs": has_bulge
                     })
 
+        # 2. Closed CIRCLE / ELLIPSE panels
         for entity in self._collect_geometry_entities():
             if entity.dxftype() in ("CIRCLE", "ELLIPSE"):
                 try:
@@ -559,6 +576,7 @@ class UnifiedFabricationEngine:
                 except Exception:
                     continue
 
+        # 3. Individual closed tile cells & loops from separate LINE / ARC / SPLINE segments
         closed_loops = self._extract_closed_loops_from_lines_and_arcs(tolerance=self.snap_tolerance)
         for poly in closed_loops:
             raw_records.append({
